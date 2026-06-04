@@ -16,7 +16,11 @@
 import { Transform, type Readable } from "node:stream";
 import { S3Client, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
-import type { AcfbakConfig } from "../config.ts";
+
+// The dated object-key convention is shared with the Worker (which computes the
+// destination key when it enqueues a run), so it lives in the host-agnostic
+// run module. Re-exported here for callers that already import it from r2.
+export { buildObjectKey } from "../run.ts";
 
 /** Cloudflare R2 S3-compatible credentials (set as runner env secrets). */
 export interface R2Credentials {
@@ -94,21 +98,6 @@ export function makeR2Client(creds: R2Credentials): S3Client {
       secretAccessKey: creds.secretAccessKey,
     },
   });
-}
-
-/** Format a Date as a UTC `YYYY-MM-DD` calendar day. */
-function utcDay(date: Date): string {
-  return date.toISOString().slice(0, 10);
-}
-
-/**
- * Build the dated object key for a backup (AC-02). Documented convention:
- *   `{keyPrefix}/{environment}/{YYYY-MM-DD}/db.sql.gz`
- * e.g. `acquia/prod/2026-06-04/db.sql.gz`. The day is the UTC calendar day of
- * `date`. Feeds retention (#4) and verification (#5).
- */
-export function buildObjectKey(config: AcfbakConfig, date: Date): string {
-  return `${config.r2.keyPrefix}/${config.acquia.environment}/${utcDay(date)}/db.sql.gz`;
 }
 
 /** A pass-through stream that tallies the bytes flowing through it. */

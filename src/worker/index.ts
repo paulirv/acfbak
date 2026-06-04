@@ -15,20 +15,54 @@
 
 import rawConfig from "../../acfbak.config.json";
 import { validateConfig, type AcfbakConfig } from "../config";
+import { buildRunContext, type BackupRunContext } from "../run";
 
 export interface Env {
   /** Destination R2 bucket — see wrangler.toml [[r2_buckets]]. */
   BACKUPS: R2Bucket;
+
+  /**
+   * Worker→runner handoff queue — see wrangler.toml [[queues.producers]]. The
+   * Worker is the producer; the runner consumes via the Queues HTTP pull API.
+   */
+  BACKUP_QUEUE: Queue<BackupRunContext>;
 
   // --- Secrets (set via `wrangler secret put`; never committed). ---
   // Wired and consumed in the runner/transfer requirements. Declared here so
   // the Worker env shape is the single typed contract for configuration.
   ACQUIA_API_KEY?: string;
   ACQUIA_API_SECRET?: string;
+  /** Shared token gating the manual /trigger endpoint (set as a secret). */
+  TRIGGER_TOKEN?: string;
+}
+
+/**
+ * The producer half of a queue we need — just `send`. Lets tests inject a fake.
+ * The return is `Promise<unknown>` so the real `Queue.send` (which resolves to a
+ * QueueSendResponse) and a void-returning fake both satisfy it.
+ */
+export interface BackupQueueProducer {
+  send(message: BackupRunContext): Promise<unknown>;
 }
 
 /** Parsed + validated declarative config, evaluated once at module load. */
 const config: AcfbakConfig = validateConfig(rawConfig);
+
+/**
+ * Initiate a backup run: build the run context for `now` + `runId` and enqueue
+ * it for the runner (the Worker→runner handoff). Returns the enqueued context
+ * so the caller can log/correlate it. The queue is passed in (not read from a
+ * closure) so this is unit-testable with a fake producer.
+ */
+export async function enqueueBackupRun(
+  queue: BackupQueueProducer,
+  now: Date,
+  runId: string,
+): Promise<BackupRunContext> {
+  const context = buildRunContext(config, now, runId);
+  await queue.send(context);
+  return context;
+}
 
 /**
  * Assert the Acquia credentials are present on the Worker env (set via
@@ -63,17 +97,19 @@ export async function writeSmokeObject(env: Env): Promise<string> {
 
 export default {
   /**
-   * Scheduled handler — fired by the Cron Trigger. For the scaffold this
-   * records the run intent; the Acquia→R2 transfer is wired in later
-   * requirements (the runner does the heavy lifting).
+   * Scheduled handler — fired by the Cron Trigger (wrangler.toml [triggers]).
+   * The Worker owns timing only: it mints a run id, enqueues the run context
+   * for the runner (the handoff), and logs the run start. The runner pulls the
+   * job from the queue and performs the Acquia→R2 transfer.
    */
-  async scheduled(event: ScheduledController, _env: Env, _ctx: ExecutionContext): Promise<void> {
+  async scheduled(event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+    const runId = crypto.randomUUID();
+    const context = await enqueueBackupRun(env.BACKUP_QUEUE, new Date(), runId);
     console.log(
-      `[acfbak] scheduled run @ cron "${event.cron}" — ` +
-        `source=${config.acquia.applicationName}/${config.acquia.environment} ` +
-        `dest=r2://${config.r2.bucket}/${config.r2.keyPrefix}`,
+      `[acfbak] scheduled run ${runId} @ cron "${event.cron}" — enqueued handoff ` +
+        `source=${context.application}/${context.environment} ` +
+        `dest=r2://${config.r2.bucket}/${context.destinationKey}`,
     );
-    // TODO(#1): hand off to runner to pull Acquia's latest backup and stream to R2.
   },
 
   /**

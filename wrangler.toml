@@ -25,6 +25,19 @@ crons = ["0 3 * * *"]
 binding = "BACKUPS"
 bucket_name = "acfbak-backups"
 
+# Worker→runner handoff queue. The Worker is the PRODUCER (env.BACKUP_QUEUE):
+# on each scheduled (or manual) run it enqueues the run context for the runner.
+#
+# The runner consumes via the Queues HTTP *pull* API — it is an external Node
+# process, not a Worker, so it is NOT a [[queues.consumers]] here. Configure the
+# pull consumer out-of-band (one-time), e.g.:
+#   wrangler queues create acfbak-backup-jobs
+#   wrangler queues consumer http add acfbak-backup-jobs
+# The runner then pulls/acks messages with a Cloudflare API token. See README.
+[[queues.producers]]
+binding = "BACKUP_QUEUE"
+queue = "acfbak-backup-jobs"
+
 [observability]
 enabled = true
 
