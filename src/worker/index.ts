@@ -30,6 +30,37 @@ export interface Env {
 /** Parsed + validated declarative config, evaluated once at module load. */
 const config: AcfbakConfig = validateConfig(rawConfig);
 
+/**
+ * Assert the Acquia credentials are present on the Worker env (set via
+ * `wrangler secret put`). Returns nothing useful but throws — loud failure —
+ * if a secret is missing, and never logs the values.
+ */
+export function requireAcquiaSecrets(env: Env): void {
+  const missing = (["ACQUIA_API_KEY", "ACQUIA_API_SECRET"] as const).filter((k) => !env[k]);
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required Worker secret(s): ${missing.join(", ")}. ` +
+        `Set them with \`wrangler secret put <NAME>\` (see README "Secrets").`,
+    );
+  }
+}
+
+/**
+ * Write a tiny object to R2 and read it back, proving the binding is wired and
+ * the destination is reachable. Returns the object key on success; throws if
+ * the round-trip fails. Used by the smoke-test endpoint and the test suite.
+ */
+export async function writeSmokeObject(env: Env): Promise<string> {
+  const key = `${config.r2.keyPrefix}/_smoke/connectivity.txt`;
+  const body = `acfbak R2 connectivity ok for ${config.r2.bucket}`;
+  await env.BACKUPS.put(key, body);
+  const readBack = await env.BACKUPS.get(key);
+  if (readBack === null || (await readBack.text()) !== body) {
+    throw new Error(`R2 smoke write failed: could not read back ${key}`);
+  }
+  return key;
+}
+
 export default {
   /**
    * Scheduled handler — fired by the Cron Trigger. For the scaffold this
@@ -49,7 +80,7 @@ export default {
    * HTTP handler — lightweight health/status endpoint and (later) the
    * on-demand backup trigger (capability #2). Never leaks secrets.
    */
-  async fetch(request: Request, _env: Env, _ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/health" || url.pathname === "/") {
@@ -65,7 +96,21 @@ export default {
           keyPrefix: config.r2.keyPrefix,
         },
         schedule: config.schedule.cron,
+        // Report secret presence without ever leaking values.
+        acquiaSecretsConfigured: Boolean(env.ACQUIA_API_KEY && env.ACQUIA_API_SECRET),
       });
+    }
+
+    if (url.pathname === "/smoke") {
+      try {
+        const key = await writeSmokeObject(env);
+        return Response.json({ wrote: true, key });
+      } catch (err) {
+        return Response.json(
+          { wrote: false, error: err instanceof Error ? err.message : String(err) },
+          { status: 500 },
+        );
+      }
     }
 
     return new Response("Not found", { status: 404 });

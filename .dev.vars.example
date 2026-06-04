@@ -1,0 +1,9 @@
+# Worker local-dev secrets for `wrangler dev`.
+#
+# Copy to `.dev.vars` (gitignored) and fill in real values for local runs.
+# In production these are set with `wrangler secret put <NAME>` — NOT from this
+# file. Never commit `.dev.vars` or real credentials.
+
+# Acquia Cloud API credentials (used to pull the latest backup).
+ACQUIA_API_KEY=""
+ACQUIA_API_SECRET=""
