@@ -21,6 +21,8 @@
  *   download: GET  /environments/{envUuid}/databases/{db}/backups/{id}/actions/download
  */
 
+import type { AcfbakConfig } from "../config.ts";
+
 /** Endpoint that exchanges an API key/secret for an OAuth 2.0 bearer token. */
 export const ACQUIA_TOKEN_URL = "https://accounts.acquia.com/api/auth/oauth/token";
 /** Base URI for all Cloud Platform API v2 resource calls. */
@@ -101,6 +103,35 @@ interface RawBackup {
   started_at: string;
   completed_at: string | null;
   flags?: { deleted?: boolean };
+}
+
+/**
+ * A working, opened download for a backup artifact (AC-03). The request has
+ * already succeeded (2xx); `body` is the live stream the runner pipes into R2
+ * (#9). `url` is the final URL after any redirect to a signed download link.
+ */
+export interface DownloadHandle {
+  /** Final URL the bytes are served from (post-redirect). */
+  url: string;
+  /** Content length in bytes if Acquia advertised it, else null. */
+  contentLength: number | null;
+  /** The artifact byte stream (null only for an empty body). */
+  body: ReadableStream<Uint8Array> | null;
+  /** The underlying response, for callers that need headers/status. */
+  response: Response;
+}
+
+/**
+ * The selected latest backup plus a lazy opener for its bytes. Selection +
+ * metadata happen eagerly (cheap, JSON); the potentially multi-GB download is
+ * deferred until {@link LatestBackup.openDownload} is called, so a caller that
+ * only needs metadata never starts the transfer.
+ */
+export interface LatestBackup {
+  /** Metadata recorded for the run (AC-05). */
+  metadata: BackupMetadata;
+  /** Begin the download for the selected backup, returning a live stream (AC-03). */
+  openDownload(): Promise<DownloadHandle>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -273,6 +304,82 @@ export class AcquiaClient {
     }
     return backups;
   }
+
+  /**
+   * Open a working download for a specific backup (AC-03). Issues the streaming
+   * GET and returns the live response without consuming its body — Acquia
+   * streams the (gzipped) dump directly, transparently following any redirect
+   * to a signed URL. Failures are surfaced clearly (AC-04):
+   *   401/403 → {@link AcquiaAuthError}, 404 → {@link AcquiaNoBackupsError}.
+   */
+  async getBackupDownload(
+    environmentUuid: string,
+    databaseName: string,
+    backupId: number,
+  ): Promise<DownloadHandle> {
+    const path = `/environments/${environmentUuid}/databases/${databaseName}/backups/${backupId}/actions/download`;
+    let res: Response;
+    try {
+      res = await this.request(path, { accept: "application/octet-stream" });
+    } catch (err) {
+      throw new AcquiaError(
+        `Network error starting backup download for backup ${backupId}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    if (res.status === 401 || res.status === 403) {
+      throw new AcquiaAuthError(
+        `Acquia API rejected the access token (HTTP ${res.status}) downloading backup ${backupId}.`,
+      );
+    }
+    if (res.status === 404) {
+      throw new AcquiaNoBackupsError(
+        `Acquia backup ${backupId} not found for ${databaseName} in environment ${environmentUuid}.`,
+      );
+    }
+    if (!res.ok) {
+      throw new AcquiaError(
+        `Acquia backup download failed (HTTP ${res.status}) for backup ${backupId}.`,
+      );
+    }
+
+    const lenHeader = res.headers.get("content-length");
+    const contentLength = lenHeader !== null && lenHeader !== "" ? Number(lenHeader) : null;
+    return {
+      url: res.url,
+      contentLength: contentLength !== null && Number.isFinite(contentLength) ? contentLength : null,
+      body: res.body,
+      response: res,
+    };
+  }
+}
+
+/**
+ * End-to-end discovery of the latest existing backup for a configured app/env
+ * (AC-01 → AC-05): authenticate, resolve the application + environment by name,
+ * list the database's backups, and select the most recent completed one. The
+ * returned {@link LatestBackup} carries the recorded metadata and a lazy
+ * `openDownload()` so callers control when bytes start flowing. Any failure is
+ * surfaced as a typed {@link AcquiaError} with a clear message.
+ */
+export async function discoverLatestBackup(
+  config: AcfbakConfig,
+  creds: AcquiaCredentials,
+  fetchImpl: FetchLike = fetch,
+): Promise<LatestBackup> {
+  const client = await AcquiaClient.authenticate(creds, fetchImpl);
+  const appUuid = await client.findApplicationUuid(config.acquia.applicationName);
+  const envUuid = await client.findEnvironmentUuid(appUuid, config.acquia.environment);
+  const db = config.acquia.database;
+
+  const backups = await client.listBackups(envUuid, db);
+  const metadata = selectLatestBackup(backups, envUuid, db);
+
+  return {
+    metadata,
+    openDownload: () => client.getBackupDownload(envUuid, db, metadata.id),
+  };
 }
 
 /**

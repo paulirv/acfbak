@@ -20,6 +20,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { validateConfig, type AcfbakConfig } from "../config.ts";
+import { discoverLatestBackup, AcquiaError, type AcquiaCredentials } from "./acquia.ts";
 
 const REQUIRED_SECRETS = [
   "ACQUIA_API_KEY",
@@ -50,26 +51,67 @@ export function requireSecrets(env: NodeJS.ProcessEnv = process.env): Record<str
 }
 
 /**
- * Entry point. For the scaffold this validates config + secrets and reports
- * what it *would* transfer; the Acquia-pull → R2-stream implementation lands
- * in the scheduled-backup requirements.
+ * Assert the Acquia credentials are present and return them as the
+ * {@link AcquiaCredentials} the client expects. The Acquia pull (this step,
+ * #7) needs only these; the R2 secrets are required when the dump is streamed
+ * to R2 (#9). Fails loud with a clear message, never echoing the values.
+ */
+export function requireAcquiaCredentials(
+  env: NodeJS.ProcessEnv = process.env,
+): AcquiaCredentials {
+  const key = env.ACQUIA_API_KEY;
+  const secret = env.ACQUIA_API_SECRET;
+  if (!key || !secret) {
+    const missing = [!key && "ACQUIA_API_KEY", !secret && "ACQUIA_API_SECRET"].filter(Boolean);
+    throw new Error(
+      `Missing required Acquia secret(s): ${missing.join(", ")}. ` +
+        `See .env.example and the README "Secrets" section.`,
+    );
+  }
+  return { key, secret };
+}
+
+/**
+ * Entry point (#7). Discovers the latest existing Acquia backup for the
+ * configured app/env, records its source metadata for the run, and confirms a
+ * working download stream can be obtained. Streaming that download into R2 is
+ * the next step (#9): here we open the download to prove it works, then release
+ * the stream without consuming the (potentially multi-GB) body.
  */
 export async function main(): Promise<void> {
   const config = loadConfig();
-  requireSecrets();
+  const creds = requireAcquiaCredentials();
 
+  const latest = await discoverLatestBackup(config, creds);
+  const { metadata } = latest;
+
+  // Record the source backup's metadata for the run (AC-05).
   console.log(
-    `[acfbak runner] ready — would pull latest backup for ` +
-      `${config.acquia.applicationName}/${config.acquia.environment} ` +
-      `and stream to r2://${config.r2.bucket}/${config.r2.keyPrefix}`,
+    `[acfbak runner] selected Acquia backup id=${metadata.id} type=${metadata.type} ` +
+      `started=${metadata.startedAt} completed=${metadata.completedAt} ` +
+      `env=${metadata.environmentUuid} db=${metadata.databaseName}`,
   );
-  // TODO(#1): pull Acquia's latest backup and stream it into R2.
+
+  // Obtain a working download stream/URL for that artifact (AC-03).
+  const download = await latest.openDownload();
+  const size = download.contentLength !== null ? `${download.contentLength} bytes` : "unknown size";
+  console.log(`[acfbak runner] download ready (${size}) — dest r2://${config.r2.bucket}/${config.r2.keyPrefix}`);
+
+  // #9 streams `download.body` to R2. For #7 we only confirm obtainability, so
+  // release the stream to avoid pulling the full dump.
+  await download.body?.cancel();
 }
 
 // Run only when invoked directly (`npm run runner`), not when imported by tests.
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   main().catch((err: unknown) => {
-    console.error("[acfbak runner] failed:", err);
+    // Surface our own typed failures (auth, no-backups, not-found) as a clean,
+    // actionable message; anything else prints in full for debugging (AC-04).
+    if (err instanceof AcquiaError) {
+      console.error(`[acfbak runner] failed: ${err.name}: ${err.message}`);
+    } else {
+      console.error("[acfbak runner] failed:", err);
+    }
     process.exit(1);
   });
 }

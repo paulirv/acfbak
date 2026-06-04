@@ -69,10 +69,14 @@ If a required secret is missing, both the Worker (`requireAcquiaSecrets`) and th
 ```bash
 npm install
 npm run dev         # wrangler dev — local Worker + local R2 on http://localhost:8787
-npm test            # vitest, run inside the Workers runtime (local R2, no account needed)
+npm test            # vitest workspace: unit (Node) + worker (Miniflare, local R2)
 npm run typecheck   # tsc --noEmit (strict)
-npm run runner      # run the transfer runner skeleton locally
+npm run runner      # discover the latest Acquia backup and confirm the download
 ```
+
+Tests are split into two vitest projects (see [`vitest.workspace.ts`](vitest.workspace.ts)): `test/unit/**` runs pure-logic tests in plain Node (the Acquia client injects `fetch`, so it needs no network or account), and `test/worker/**` runs binding-integration tests inside the Workers runtime via Miniflare.
+
+With Acquia credentials configured, `npm run runner` authenticates, lists the configured environment's database backups, selects the most recent completed one, prints its source metadata (id, type, timestamps), and confirms a working download stream can be obtained. Streaming that dump into R2 is the next step ([#9](https://github.com/paulirv/acfbak/issues/9)).
 
 Quick checks against a running dev server:
 
@@ -104,10 +108,13 @@ wrangler.toml               Cloudflare platform manifest (cron + R2 binding)
 dev.json                    dev-environment manifest (dev-up / warp-drive)
 src/config.ts               shared config types + validator (env-agnostic)
 src/worker/index.ts         orchestrator Worker (scheduled + fetch handlers)
-src/runner/index.ts         transfer runner skeleton
-test/r2-smoke.test.ts       R2 binding smoke test + secret-hygiene test
+src/runner/index.ts         transfer runner entry (discover latest backup)
+src/runner/acquia.ts        Acquia Cloud API v2 client (auth, list, select, download)
+vitest.workspace.ts         vitest projects: unit (Node) + worker (Miniflare)
+test/unit/acquia.test.ts    Acquia client unit tests (injected fetch, offline)
+test/worker/r2-smoke.test.ts  R2 binding smoke test + secret-hygiene test
 ```
 
 ## Status
 
-Early scaffold (capability [#1](https://github.com/paulirv/acfbak/issues/1)). The Acquia-pull → R2-stream transfer is stubbed (`TODO(#1)`); the scheduling, config, secret handling, and R2 binding are wired and tested.
+Building out capability [#1](https://github.com/paulirv/acfbak/issues/1). The runner now discovers and retrieves the latest existing Acquia backup ([#7](https://github.com/paulirv/acfbak/issues/7)): it authenticates to the Cloud API v2, lists the configured environment's database backups, selects the most recent completed one, records its metadata, and obtains a working download stream. Streaming that dump into R2 with dated naming ([#9](https://github.com/paulirv/acfbak/issues/9)) and the Worker→runner cron handoff ([#8](https://github.com/paulirv/acfbak/issues/8)) are next. Scheduling, config, secret handling, and the R2 binding are wired and tested.

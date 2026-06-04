@@ -2,13 +2,16 @@ import { describe, it, expect } from "vitest";
 import {
   getAccessToken,
   selectLatestBackup,
+  discoverLatestBackup,
   AcquiaClient,
+  AcquiaError,
   AcquiaAuthError,
   AcquiaNoBackupsError,
   AcquiaNotFoundError,
   ACQUIA_TOKEN_URL,
   type FetchLike,
 } from "../../src/runner/acquia.ts";
+import type { AcfbakConfig } from "../../src/config.ts";
 
 // A tiny fetch double: route by URL substring to a canned JSON response (or a
 // status-only response). Keeps tests offline and deterministic — the Acquia
@@ -192,5 +195,119 @@ describe("selectLatestBackup (AC-02 / AC-04 / AC-05)", () => {
 
   it("throws AcquiaNoBackupsError on an empty list", () => {
     expect(() => selectLatestBackup([], env, db)).toThrow(AcquiaNoBackupsError);
+  });
+});
+
+describe("AcquiaClient.getBackupDownload (AC-03 / AC-04)", () => {
+  it("returns a live stream and content length on success", async () => {
+    const fetchImpl = routerFetch([
+      {
+        match: "/actions/download",
+        respond: () =>
+          new Response("dump-bytes", {
+            status: 200,
+            headers: { "content-length": "10" },
+          }),
+      },
+    ]);
+    const client = new AcquiaClient("tok", fetchImpl);
+    const dl = await client.getBackupDownload("env-prod", "default", 42);
+    expect(dl.contentLength).toBe(10);
+    expect(dl.body).not.toBeNull();
+    expect(await new Response(dl.body).text()).toBe("dump-bytes");
+  });
+
+  it("maps a 404 to AcquiaNoBackupsError", async () => {
+    const fetchImpl = routerFetch([
+      { match: "/actions/download", respond: () => new Response("", { status: 404 }) },
+    ]);
+    const client = new AcquiaClient("tok", fetchImpl);
+    await expect(client.getBackupDownload("env-prod", "default", 99)).rejects.toBeInstanceOf(
+      AcquiaNoBackupsError,
+    );
+  });
+
+  it("maps a 403 to AcquiaAuthError", async () => {
+    const fetchImpl = routerFetch([
+      { match: "/actions/download", respond: () => new Response("", { status: 403 }) },
+    ]);
+    const client = new AcquiaClient("tok", fetchImpl);
+    await expect(client.getBackupDownload("env-prod", "default", 7)).rejects.toBeInstanceOf(
+      AcquiaAuthError,
+    );
+  });
+});
+
+describe("discoverLatestBackup end-to-end (AC-01 → AC-05)", () => {
+  const config: AcfbakConfig = {
+    acquia: { applicationName: "my-drupal-app", environment: "prod", database: "default" },
+    r2: { binding: "BACKUPS", bucket: "acfbak-backups", keyPrefix: "acquia" },
+    schedule: { cron: "0 3 * * *", timezone: "UTC" },
+  };
+
+  // Route the full token → apps → envs → backups → download chain. Order
+  // matters: more specific paths are matched before their prefixes.
+  function fullChainFetch(): FetchLike {
+    return routerFetch([
+      { match: ACQUIA_TOKEN_URL, respond: () => jsonResponse({ access_token: "tok" }) },
+      {
+        match: "/actions/download",
+        respond: () => new Response("the-dump", { status: 200, headers: { "content-length": "8" } }),
+      },
+      {
+        match: "/databases/default/backups",
+        respond: () =>
+          jsonResponse({
+            _embedded: {
+              items: [
+                { id: 100, type: "daily", started_at: "2026-06-01T03:00:00Z", completed_at: "2026-06-01T03:05:00Z" },
+                { id: 200, type: "daily", started_at: "2026-06-03T03:00:00Z", completed_at: "2026-06-03T03:06:00Z" },
+              ],
+            },
+          }),
+      },
+      {
+        match: "/applications/app-uuid/environments",
+        respond: () => jsonResponse({ _embedded: { items: [{ uuid: "env-prod", name: "prod" }] } }),
+      },
+      {
+        match: "/applications",
+        respond: () => jsonResponse({ _embedded: { items: [{ uuid: "app-uuid", name: "my-drupal-app" }] } }),
+      },
+    ]);
+  }
+
+  it("authenticates, selects the latest backup, records metadata, and opens the download", async () => {
+    const latest = await discoverLatestBackup(config, { key: "k", secret: "s" }, fullChainFetch());
+
+    expect(latest.metadata.id).toBe(200);
+    expect(latest.metadata.environmentUuid).toBe("env-prod");
+    expect(latest.metadata.databaseName).toBe("default");
+    expect(latest.metadata.completedAt).toBe("2026-06-03T03:06:00Z");
+
+    const dl = await latest.openDownload();
+    expect(dl.contentLength).toBe(8);
+    expect(await new Response(dl.body).text()).toBe("the-dump");
+  });
+
+  it("surfaces a no-backups environment as AcquiaNoBackupsError", async () => {
+    const fetchImpl = routerFetch([
+      { match: ACQUIA_TOKEN_URL, respond: () => jsonResponse({ access_token: "tok" }) },
+      { match: "/databases/default/backups", respond: () => jsonResponse({ _embedded: { items: [] } }) },
+      { match: "/applications/app-uuid/environments", respond: () => jsonResponse({ _embedded: { items: [{ uuid: "app-uuid", name: "prod" }] } }) },
+      { match: "/applications", respond: () => jsonResponse({ _embedded: { items: [{ uuid: "app-uuid", name: "my-drupal-app" }] } }) },
+    ]);
+    await expect(
+      discoverLatestBackup(config, { key: "k", secret: "s" }, fetchImpl),
+    ).rejects.toBeInstanceOf(AcquiaNoBackupsError);
+  });
+
+  it("propagates an auth failure from the token step as AcquiaError", async () => {
+    const fetchImpl = routerFetch([
+      { match: ACQUIA_TOKEN_URL, respond: () => jsonResponse({}, 401) },
+    ]);
+    await expect(
+      discoverLatestBackup(config, { key: "k", secret: "bad" }, fetchImpl),
+    ).rejects.toBeInstanceOf(AcquiaError);
   });
 });
