@@ -36,8 +36,12 @@ Edit `acfbak.config.json` to point at your Acquia app/environment and your R2 bu
 | `R2_ACCOUNT_ID` | runner | Cloudflare account ID (R2 S3-compatible endpoint). |
 | `R2_ACCESS_KEY_ID` | runner | R2 API token access key (Object Read & Write). |
 | `R2_SECRET_ACCESS_KEY` | runner | R2 API token secret. |
+| `TRIGGER_TOKEN` | Worker | Gates the manual `POST /trigger` endpoint (unset ⇒ disabled). |
+| `CF_ACCOUNT_ID` | runner (`--consume`) | Cloudflare account ID (same account as `R2_ACCOUNT_ID`). |
+| `CF_API_TOKEN` | runner (`--consume`) | API token with **Queues** read + edit — pull/ack handoff messages. |
+| `CF_QUEUE_ID` | runner (`--consume`) | Handoff queue id (UUID) — `wrangler queues list`. |
 
-The Worker writes to R2 through its **binding** (`env.BACKUPS`), so it does not need the R2 S3 keys — those are only for the runner, which writes from outside Cloudflare.
+The Worker writes to R2 through its **binding** (`env.BACKUPS`), so it does not need the R2 S3 keys — those are only for the runner, which writes from outside Cloudflare. The `CF_*` secrets are only needed for the queue-driven consumer (`npm run runner -- --consume`).
 
 ### Setting secrets
 
@@ -122,30 +126,44 @@ curl -X POST https://<worker-host>/trigger -H "x-acfbak-token: $TRIGGER_TOKEN"
 # → { "triggered": true, "runId": "…", "destinationKey": "acquia/prod/…/db.sql.gz" }
 ```
 
-> **Remaining:** the runner's queue **pull-consume loop** (pull → run transfer →
-> ack) is tracked separately — it's the half that closes the scheduled path end
-> to end. The Worker producer side and the manual trigger are implemented here.
+#### Running the consumer
+
+The runner consumes the queue with the `CF_*` secrets above (the API token needs
+the **Queues** permission, read + edit):
+
+```bash
+npm run runner -- --consume
+```
+
+This performs one **drain pass**: it pulls a batch, runs the transfer for each
+message to that message's destination key, acks the successes, and marks any
+failures for retry (the queue redelivers them). One-shot by design — run it on a
+schedule on the runner host (e.g. a cron job / CI workflow), or wrap it in a loop
+for an always-on consumer. A bare `npm run runner` instead does a single
+standalone transfer under today's dated key without touching the queue.
 
 ## Project layout
 
 ```
 acfbak.config.json          declarative config (Acquia source, R2 dest, schedule)
 acfbak.config.schema.json   JSON Schema for the above
-wrangler.toml               Cloudflare platform manifest (cron + R2 binding)
+wrangler.toml               Cloudflare platform manifest (cron + R2 binding + queue)
 dev.json                    dev-environment manifest (dev-up / warp-drive)
+vitest.workspace.ts         vitest projects: unit (Node) + worker (Miniflare)
 src/config.ts               shared config types + validator (env-agnostic)
-src/worker/index.ts         orchestrator Worker (scheduled + fetch handlers)
-src/runner/index.ts         transfer runner entry (pull latest backup → stream to R2)
+src/run.ts                  shared run-context + dated object-key (Worker ↔ runner)
+src/worker/index.ts         orchestrator Worker (scheduled + fetch handlers, queue producer)
+src/runner/index.ts         transfer runner entry (one-shot + --consume queue drain)
 src/runner/acquia.ts        Acquia Cloud API v2 client (auth, list, select, download)
 src/runner/r2.ts            R2 S3-compatible streaming uploader (dated key, size check)
-vitest.workspace.ts         vitest projects: unit (Node) + worker (Miniflare)
+src/runner/queue.ts         Cloudflare Queues HTTP pull/ack client + drain loop
 test/unit/acquia.test.ts    Acquia client unit tests (injected fetch, offline)
-src/run.ts                  shared run-context + dated object-key (Worker ↔ runner)
 test/unit/r2.test.ts        R2 uploader unit tests (injected transport, offline)
 test/unit/run.test.ts       run-context + Worker enqueue-handoff unit tests
+test/unit/queue.test.ts     queue client + drain orchestration unit tests (offline)
 test/worker/worker.test.ts  Worker integration tests (R2 binding, scheduled handoff, /trigger)
 ```
 
 ## Status
 
-Building out capability [#1](https://github.com/paulirv/acfbak/issues/1). The runner performs the full transfer — discover and retrieve the latest existing Acquia backup ([#7](https://github.com/paulirv/acfbak/issues/7)) and stream it into R2 under a dated key with size verification ([#9](https://github.com/paulirv/acfbak/issues/9)). The Worker now schedules runs and hands off to the runner via a Cloudflare Queue, with a manual `/trigger` path ([#8](https://github.com/paulirv/acfbak/issues/8)). The remaining piece to close the scheduled path end to end is the runner's queue pull-consume loop. Config, secret handling, and the R2 binding are wired and tested.
+The scheduled daily backup ([#1](https://github.com/paulirv/acfbak/issues/1)) is wired end to end: the Worker fires on cron, mints a run id, and hands off to the runner via a Cloudflare Queue, with a token-gated manual `/trigger` path ([#8](https://github.com/paulirv/acfbak/issues/8)). The runner consumes the queue ([#27](https://github.com/paulirv/acfbak/issues/27)), pulls the latest existing Acquia backup ([#7](https://github.com/paulirv/acfbak/issues/7)), and streams it into R2 under a dated key with size verification ([#9](https://github.com/paulirv/acfbak/issues/9)). All component paths are unit/integration tested; a live end-to-end run awaits provisioned Acquia + Cloudflare credentials. Next: observability & alerting ([#3](https://github.com/paulirv/acfbak/issues/3)) and on-demand backups ([#2](https://github.com/paulirv/acfbak/issues/2)).

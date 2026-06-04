@@ -2,12 +2,17 @@ import { describe, it, expect } from "vitest";
 import {
   QueuePullClient,
   requireQueueCredentials,
+  drainQueueOnce,
   QueueError,
   QueueAuthError,
   CF_API_BASE,
   type FetchLike,
   type QueueCredentials,
+  type QueueConsumer,
+  type PulledMessage,
+  type QueueRetry,
 } from "../../src/runner/queue.ts";
+import type { BackupRunContext } from "../../src/run.ts";
 import { buildRunContext } from "../../src/run.ts";
 import type { AcfbakConfig } from "../../src/config.ts";
 
@@ -135,5 +140,77 @@ describe("QueuePullClient.ack (AC-03 support)", () => {
     const client = new QueuePullClient(creds, fetchImpl);
     await client.ack([], []);
     expect(calls).toHaveLength(0);
+  });
+});
+
+// A fake consumer that returns a fixed batch and records what gets acked/retried.
+function fakeConsumer(messages: PulledMessage[]): {
+  consumer: QueueConsumer;
+  acked: () => string[];
+  retried: () => QueueRetry[];
+} {
+  let ackedIds: string[] = [];
+  let retriedItems: QueueRetry[] = [];
+  const consumer: QueueConsumer = {
+    async pull() {
+      return messages;
+    },
+    async ack(ackLeaseIds, retries = []) {
+      ackedIds = ackLeaseIds;
+      retriedItems = retries;
+    },
+  };
+  return { consumer, acked: () => ackedIds, retried: () => retriedItems };
+}
+
+function message(runId: string, leaseId: string): PulledMessage {
+  const context: BackupRunContext = {
+    runId,
+    application: "my-drupal-app",
+    environment: "prod",
+    database: "default",
+    destinationKey: `acquia/prod/2026-06-04/db.sql.gz`,
+    enqueuedAt: "2026-06-04T03:00:00.000Z",
+  };
+  return { id: `msg-${runId}`, leaseId, attempts: 1, context };
+}
+
+describe("drainQueueOnce (AC-02 / AC-03)", () => {
+  it("runs the handler per message and acks the successes", async () => {
+    const { consumer, acked, retried } = fakeConsumer([
+      message("r1", "lease-1"),
+      message("r2", "lease-2"),
+    ]);
+    const handled: string[] = [];
+
+    const summary = await drainQueueOnce(consumer, async (ctx) => {
+      handled.push(ctx.runId);
+    });
+
+    expect(handled).toEqual(["r1", "r2"]);
+    expect(summary).toEqual({ pulled: 2, acked: 2, retried: 0 });
+    expect(acked()).toEqual(["lease-1", "lease-2"]);
+    expect(retried()).toEqual([]);
+  });
+
+  it("retries the message whose handler throws, acks the rest", async () => {
+    const { consumer, acked, retried } = fakeConsumer([
+      message("ok", "lease-ok"),
+      message("boom", "lease-boom"),
+    ]);
+
+    const summary = await drainQueueOnce(consumer, async (ctx) => {
+      if (ctx.runId === "boom") throw new Error("transfer failed");
+    });
+
+    expect(summary).toEqual({ pulled: 2, acked: 1, retried: 1 });
+    expect(acked()).toEqual(["lease-ok"]);
+    expect(retried()).toEqual([{ leaseId: "lease-boom" }]);
+  });
+
+  it("reports zeros for an empty queue", async () => {
+    const { consumer } = fakeConsumer([]);
+    const summary = await drainQueueOnce(consumer, async () => {});
+    expect(summary).toEqual({ pulled: 0, acked: 0, retried: 0 });
   });
 });

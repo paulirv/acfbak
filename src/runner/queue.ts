@@ -209,3 +209,50 @@ export class QueuePullClient {
     });
   }
 }
+
+/** The consumer operations {@link drainQueueOnce} needs (satisfied by QueuePullClient). */
+export interface QueueConsumer {
+  pull(opts?: { batchSize?: number; visibilityTimeoutMs?: number }): Promise<PulledMessage[]>;
+  ack(ackLeaseIds: string[], retries?: QueueRetry[]): Promise<void>;
+}
+
+/** Outcome of a single drain pass. */
+export interface DrainSummary {
+  pulled: number;
+  acked: number;
+  retried: number;
+}
+
+/**
+ * One pull→process→ack cycle (AC-02/AC-03): lease a batch, run `handler` for
+ * each message's run context, then acknowledge the ones that succeeded and mark
+ * the ones that threw for retry (so the queue redelivers them). One-shot by
+ * design — wrap it in a loop for an always-on consumer, or invoke it per
+ * scheduled tick for a cron-triggered runner. Per-run failures are isolated:
+ * one failing message never blocks acking the others.
+ */
+export async function drainQueueOnce(
+  consumer: QueueConsumer,
+  handler: (context: BackupRunContext) => Promise<void>,
+  opts: { batchSize?: number; visibilityTimeoutMs?: number } = {},
+): Promise<DrainSummary> {
+  const messages = await consumer.pull(opts);
+  const acks: string[] = [];
+  const retries: QueueRetry[] = [];
+
+  for (const message of messages) {
+    try {
+      await handler(message.context);
+      acks.push(message.leaseId);
+    } catch (err) {
+      console.error(
+        `[acfbak runner] run ${message.context.runId} failed; will retry: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      retries.push({ leaseId: message.leaseId });
+    }
+  }
+
+  await consumer.ack(acks, retries);
+  return { pulled: messages.length, acked: acks.length, retried: retries.length };
+}
