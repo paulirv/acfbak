@@ -1,0 +1,32 @@
+# Cloudflare platform manifest for the acfbak Worker (orchestrator).
+#
+# This file is the SINGLE SOURCE OF TRUTH for the Cloudflare platform:
+#   - the cron schedule that wakes the orchestrator        ([triggers].crons)
+#   - the R2 bucket binding the Worker writes through      ([[r2_buckets]])
+#
+# Application-level declarative config (Acquia source app/env, R2 key prefix)
+# lives in acfbak.config.json. Keep the cron expression here in sync with
+# acfbak.config.json `schedule.cron` — this file is authoritative for the
+# platform trigger; the config file documents intent for the runner/tooling.
+
+name = "acfbak"
+main = "src/worker/index.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Orchestrator schedule — daily at 03:00 UTC. Authoritative platform trigger.
+[triggers]
+crons = ["0 3 * * *"]
+
+# Destination R2 bucket. `binding` is exposed on the Worker env as env.BACKUPS.
+# bucket_name must match an R2 bucket in your Cloudflare account (create with:
+# `wrangler r2 bucket create acfbak-backups`).
+[[r2_buckets]]
+binding = "BACKUPS"
+bucket_name = "acfbak-backups"
+
+[observability]
+enabled = true
+
+# NOTE: No secrets here. Acquia credentials are set via `wrangler secret put`
+# (see README). Never commit credentials to this file.

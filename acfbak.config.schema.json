@@ -1,0 +1,76 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/paulirv/acfbak/acfbak.config.schema.json",
+  "title": "acfbak configuration",
+  "description": "Declarative configuration for acfbak: which Acquia environment to back up, which R2 bucket to write to, and on what schedule. Credentials are NOT defined here — they are supplied as secrets.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["acquia", "r2", "schedule"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "acquia": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["applicationName", "environment"],
+      "description": "Acquia Cloud source. acfbak pulls the latest existing backup for this app/environment.",
+      "properties": {
+        "applicationName": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Acquia Cloud application (subscription) name or UUID."
+        },
+        "environment": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Acquia environment to back up (e.g. prod, test, dev)."
+        },
+        "database": {
+          "type": "string",
+          "default": "default",
+          "description": "Database name within the environment. Defaults to the site's primary database."
+        }
+      }
+    },
+    "r2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binding", "bucket"],
+      "description": "Cloudflare R2 destination. `binding` must match the [[r2_buckets]] binding in wrangler.toml; `bucket` must match its bucket_name.",
+      "properties": {
+        "binding": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Worker env binding name for the destination bucket (wrangler.toml [[r2_buckets]].binding)."
+        },
+        "bucket": {
+          "type": "string",
+          "minLength": 1,
+          "description": "R2 bucket name (wrangler.toml [[r2_buckets]].bucket_name)."
+        },
+        "keyPrefix": {
+          "type": "string",
+          "default": "acquia",
+          "description": "Object key prefix under which backups are stored, e.g. <keyPrefix>/<env>/<timestamp>.sql.gz."
+        }
+      }
+    },
+    "schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cron"],
+      "description": "Backup schedule. The cron expression must be mirrored in wrangler.toml [triggers].crons, which is authoritative for the Cloudflare platform trigger.",
+      "properties": {
+        "cron": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Cron expression for the scheduled backup (UTC)."
+        },
+        "timezone": {
+          "type": "string",
+          "default": "UTC",
+          "description": "Documentation-only timezone label. Cloudflare cron triggers run in UTC."
+        }
+      }
+    }
+  }
+}

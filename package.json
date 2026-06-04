@@ -1,0 +1,23 @@
+{
+  "name": "acfbak",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Acquia Cloud → Cloudflare R2 backup: a Worker orchestrates the schedule, a runner transfers the dump.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "runner": "node --experimental-strip-types src/runner/index.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.5.40",
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.3",
+    "vitest": "2.1.9",
+    "wrangler": "3.99.0"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "./acfbak.config.schema.json",
+  "acquia": {
+    "applicationName": "my-drupal-app",
+    "environment": "prod",
+    "database": "default"
+  },
+  "r2": {
+    "binding": "BACKUPS",
+    "bucket": "acfbak-backups",
+    "keyPrefix": "acquia"
+  },
+  "schedule": {
+    "cron": "0 3 * * *",
+    "timezone": "UTC"
+  }
+}
