@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/paulirv/bigbrain/master/schemas/dev.schema.json",
+  "_comment": "acfbak has no database — only a Cloudflare Worker (wrangler dev, with a local R2). No migrations, seed, or auth steps.",
+  "server": {
+    "command": "npm run dev",
+    "port": 8787,
+    "health": "/health",
+    "restart": "on-failure",
+    "env": {}
+  },
+  "access": {
+    "localhost": "http://localhost:8787"
+  }
+}
