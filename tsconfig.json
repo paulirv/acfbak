@@ -16,6 +16,6 @@
     "verbatimModuleSyntax": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "*.config.ts"],
+  "include": ["src/**/*.ts", "test/**/*.ts", "*.config.ts", "vitest.workspace.ts"],
   "exclude": ["node_modules", "dist"]
 }

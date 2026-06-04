@@ -1,6 +1,6 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import { writeSmokeObject } from "../src/worker/index.ts";
+import { writeSmokeObject } from "../../src/worker/index.ts";
 
 // AC-04: the R2 bucket binding is wired and a trivial write succeeds.
 // These run against the Miniflare-backed local R2 provided by the workers
