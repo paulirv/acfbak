@@ -62,7 +62,7 @@ cp .env.example .env
 # edit .env
 ```
 
-If a required secret is missing, both the Worker (`requireAcquiaSecrets`) and the runner (`requireSecrets`) fail loudly rather than running half-configured.
+If a required secret is missing, both the Worker (`requireAcquiaSecrets`) and the runner (`requireAcquiaCredentials` for the Acquia pull, `requireR2Credentials` for the R2 write) fail loudly rather than running half-configured.
 
 ## Development
 
@@ -76,7 +76,7 @@ npm run runner      # discover the latest Acquia backup and confirm the download
 
 Tests are split into two vitest projects (see [`vitest.workspace.ts`](vitest.workspace.ts)): `test/unit/**` runs pure-logic tests in plain Node (the Acquia client injects `fetch`, so it needs no network or account), and `test/worker/**` runs binding-integration tests inside the Workers runtime via Miniflare.
 
-With Acquia credentials configured, `npm run runner` authenticates, lists the configured environment's database backups, selects the most recent completed one, prints its source metadata (id, type, timestamps), and confirms a working download stream can be obtained. Streaming that dump into R2 is the next step ([#9](https://github.com/paulirv/acfbak/issues/9)).
+With Acquia **and** R2 credentials configured, `npm run runner` authenticates, lists the configured environment's database backups, selects the most recent completed one, then streams that dump straight into R2 under a dated key (`{keyPrefix}/{env}/{YYYY-MM-DD}/db.sql.gz`) via a multipart upload — the bytes are never fully buffered, so multi-GB dumps stay within bounded memory. It verifies the stored object size against what was streamed (rejecting zero-byte or truncated results) and prints the destination key and size.
 
 Quick checks against a running dev server:
 
@@ -108,13 +108,15 @@ wrangler.toml               Cloudflare platform manifest (cron + R2 binding)
 dev.json                    dev-environment manifest (dev-up / warp-drive)
 src/config.ts               shared config types + validator (env-agnostic)
 src/worker/index.ts         orchestrator Worker (scheduled + fetch handlers)
-src/runner/index.ts         transfer runner entry (discover latest backup)
+src/runner/index.ts         transfer runner entry (pull latest backup → stream to R2)
 src/runner/acquia.ts        Acquia Cloud API v2 client (auth, list, select, download)
+src/runner/r2.ts            R2 S3-compatible streaming uploader (dated key, size check)
 vitest.workspace.ts         vitest projects: unit (Node) + worker (Miniflare)
 test/unit/acquia.test.ts    Acquia client unit tests (injected fetch, offline)
+test/unit/r2.test.ts        R2 uploader unit tests (injected transport, offline)
 test/worker/r2-smoke.test.ts  R2 binding smoke test + secret-hygiene test
 ```
 
 ## Status
 
-Building out capability [#1](https://github.com/paulirv/acfbak/issues/1). The runner now discovers and retrieves the latest existing Acquia backup ([#7](https://github.com/paulirv/acfbak/issues/7)): it authenticates to the Cloud API v2, lists the configured environment's database backups, selects the most recent completed one, records its metadata, and obtains a working download stream. Streaming that dump into R2 with dated naming ([#9](https://github.com/paulirv/acfbak/issues/9)) and the Worker→runner cron handoff ([#8](https://github.com/paulirv/acfbak/issues/8)) are next. Scheduling, config, secret handling, and the R2 binding are wired and tested.
+Building out capability [#1](https://github.com/paulirv/acfbak/issues/1). The runner now performs the full transfer: it discovers and retrieves the latest existing Acquia backup ([#7](https://github.com/paulirv/acfbak/issues/7)) and streams it into R2 under a dated key, verifying the stored size ([#9](https://github.com/paulirv/acfbak/issues/9)). What remains for the scheduled path is the Worker→runner cron handoff ([#8](https://github.com/paulirv/acfbak/issues/8)) — currently the Worker logs the run intent but does not yet invoke the runner. Scheduling, config, secret handling, and the R2 binding are wired and tested.

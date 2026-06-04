@@ -1,5 +1,5 @@
 /**
- * acfbak runner — transfer worker (skeleton).
+ * acfbak runner — transfer process.
  *
  * Role (per docs/vision.md "Worker orchestrates, runner transfers"):
  *   - performs the heavy byte transfer that the Worker is too constrained for
@@ -7,8 +7,8 @@
  *   - streams that dump into the configured R2 bucket (S3-compatible API)
  *
  * Where this runs (GitHub Actions vs. container) is an open question in the
- * vision; this skeleton is host-agnostic and reads everything it needs from
- * the declarative config + environment secrets.
+ * vision; the runner reads everything it needs from the declarative config +
+ * environment secrets, so it is host-agnostic.
  *
  * Secrets (never committed — see .env.example / README):
  *   ACQUIA_API_KEY, ACQUIA_API_SECRET        — pull the dump from Acquia Cloud
@@ -19,16 +19,17 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
+import { Readable } from "node:stream";
+import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
 import { validateConfig, type AcfbakConfig } from "../config.ts";
 import { discoverLatestBackup, AcquiaError, type AcquiaCredentials } from "./acquia.ts";
-
-const REQUIRED_SECRETS = [
-  "ACQUIA_API_KEY",
-  "ACQUIA_API_SECRET",
-  "R2_ACCOUNT_ID",
-  "R2_ACCESS_KEY_ID",
-  "R2_SECRET_ACCESS_KEY",
-] as const;
+import {
+  requireR2Credentials,
+  makeR2Client,
+  s3Transport,
+  buildObjectKey,
+  streamBackupToR2,
+} from "./r2.ts";
 
 /** Load and validate acfbak.config.json from the repo root. */
 export function loadConfig(configPath?: string): AcfbakConfig {
@@ -36,18 +37,6 @@ export function loadConfig(configPath?: string): AcfbakConfig {
   const path = configPath ?? resolve(here, "../../acfbak.config.json");
   const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
   return validateConfig(raw);
-}
-
-/** Assert all required runner secrets are present; fail loud if not. */
-export function requireSecrets(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
-  const missing = REQUIRED_SECRETS.filter((name) => !env[name]);
-  if (missing.length > 0) {
-    throw new Error(
-      `Missing required runner secret(s): ${missing.join(", ")}. ` +
-        `See .env.example and the README "Secrets" section.`,
-    );
-  }
-  return Object.fromEntries(REQUIRED_SECRETS.map((name) => [name, env[name] as string]));
 }
 
 /**
@@ -72,34 +61,55 @@ export function requireAcquiaCredentials(
 }
 
 /**
- * Entry point (#7). Discovers the latest existing Acquia backup for the
- * configured app/env, records its source metadata for the run, and confirms a
- * working download stream can be obtained. Streaming that download into R2 is
- * the next step (#9): here we open the download to prove it works, then release
- * the stream without consuming the (potentially multi-GB) body.
+ * Entry point. Pulls Acquia's latest existing backup for the configured
+ * app/env (#7) and streams it straight into R2 under a dated key (#9):
+ *   discover latest backup → open its download → pipe to R2 (multipart,
+ *   never fully buffered) → verify the stored size → record key + size.
+ *
+ * Because the transfer is fully streaming (the source response body flows
+ * directly into a multipart upload with no intermediate buffer on disk or in
+ * memory), peak memory is bounded by the multipart part size regardless of
+ * dump size — so a representative production database completes within the
+ * runner host's resources (AC-04). The runner is a plain host process, so it
+ * is not subject to the Worker's CPU/time limits.
  */
 export async function main(): Promise<void> {
   const config = loadConfig();
-  const creds = requireAcquiaCredentials();
+  const acquiaCreds = requireAcquiaCredentials();
+  const r2Creds = requireR2Credentials();
 
-  const latest = await discoverLatestBackup(config, creds);
+  const latest = await discoverLatestBackup(config, acquiaCreds);
   const { metadata } = latest;
 
-  // Record the source backup's metadata for the run (AC-05).
+  // Record the source backup's metadata for the run.
   console.log(
     `[acfbak runner] selected Acquia backup id=${metadata.id} type=${metadata.type} ` +
       `started=${metadata.startedAt} completed=${metadata.completedAt} ` +
       `env=${metadata.environmentUuid} db=${metadata.databaseName}`,
   );
 
-  // Obtain a working download stream/URL for that artifact (AC-03).
+  // Open the download (AC-03 from #7) and stream it directly into R2 (AC-01).
   const download = await latest.openDownload();
-  const size = download.contentLength !== null ? `${download.contentLength} bytes` : "unknown size";
-  console.log(`[acfbak runner] download ready (${size}) — dest r2://${config.r2.bucket}/${config.r2.keyPrefix}`);
+  if (download.body === null) {
+    throw new Error("Acquia download returned an empty body — nothing to stream to R2.");
+  }
 
-  // #9 streams `download.body` to R2. For #7 we only confirm obtainability, so
-  // release the stream to avoid pulling the full dump.
-  await download.body?.cancel();
+  const key = buildObjectKey(config, new Date());
+  // fetch's Response.body is a web ReadableStream; Readable.fromWeb adapts it to
+  // a Node stream for the AWS SDK without buffering. (Cast bridges the ambient
+  // ReadableStream type to node:stream/web's.)
+  const body = Readable.fromWeb(download.body as unknown as NodeWebReadableStream<Uint8Array>);
+
+  const transport = s3Transport(makeR2Client(r2Creds));
+  const result = await streamBackupToR2(
+    { bucket: config.r2.bucket, key, body, sourceContentLength: download.contentLength },
+    transport,
+  );
+
+  // Record the destination key and verified object size for the run (AC-05).
+  console.log(
+    `[acfbak runner] stored r2://${config.r2.bucket}/${result.key} (${result.size} bytes)`,
+  );
 }
 
 // Run only when invoked directly (`npm run runner`), not when imported by tests.
