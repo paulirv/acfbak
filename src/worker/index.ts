@@ -132,8 +132,40 @@ export default {
           keyPrefix: config.r2.keyPrefix,
         },
         schedule: config.schedule.cron,
-        // Report secret presence without ever leaking values.
+        // Report presence/wiring without ever leaking values.
         acquiaSecretsConfigured: Boolean(env.ACQUIA_API_KEY && env.ACQUIA_API_SECRET),
+        manualTriggerEnabled: Boolean(env.TRIGGER_TOKEN),
+      });
+    }
+
+    // Manual invoke path (AC-04): fire a run now without waiting for cron, for
+    // testing the handoff. Token-gated and fail-closed — it enqueues the same
+    // run context the scheduled handler does.
+    if (url.pathname === "/trigger") {
+      if (request.method !== "POST") {
+        return Response.json({ error: "method not allowed; use POST" }, { status: 405 });
+      }
+      if (!env.TRIGGER_TOKEN) {
+        return Response.json(
+          { error: "manual trigger not configured; set the TRIGGER_TOKEN secret" },
+          { status: 503 },
+        );
+      }
+      if (request.headers.get("x-acfbak-token") !== env.TRIGGER_TOKEN) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+
+      const runId = crypto.randomUUID();
+      const context = await enqueueBackupRun(env.BACKUP_QUEUE, new Date(), runId);
+      console.log(
+        `[acfbak] manual run ${runId} — enqueued handoff ` +
+          `source=${context.application}/${context.environment} ` +
+          `dest=r2://${config.r2.bucket}/${context.destinationKey}`,
+      );
+      return Response.json({
+        triggered: true,
+        runId,
+        destinationKey: context.destinationKey,
       });
     }
 

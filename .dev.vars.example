@@ -7,3 +7,7 @@
 # Acquia Cloud API credentials (used to pull the latest backup).
 ACQUIA_API_KEY=""
 ACQUIA_API_SECRET=""
+
+# Shared token gating the manual POST /trigger endpoint (fire a run without
+# waiting for cron). If unset, /trigger is disabled (returns 503).
+TRIGGER_TOKEN=""

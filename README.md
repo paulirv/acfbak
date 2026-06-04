@@ -93,11 +93,38 @@ This project ships a [`dev.json`](dev.json) manifest, so `dev-up` (and warp-driv
 # One-time: create the destination bucket.
 wrangler r2 bucket create acfbak-backups
 
+# One-time: create the handoff queue and attach an HTTP pull consumer.
+wrangler queues create acfbak-backup-jobs
+wrangler queues consumer http add acfbak-backup-jobs
+
 # Set production secrets (see above), then deploy.
 wrangler deploy
 ```
 
-The cron trigger in `wrangler.toml` schedules the orchestrator; the runner is deployed/scheduled on its chosen host (TBD per the vision).
+The cron trigger in `wrangler.toml` schedules the orchestrator Worker.
+
+### Scheduling & Worker→runner handoff
+
+The Worker owns timing only. On each scheduled run (and on a manual trigger) it
+mints a `runId`, enqueues a **run context** (`runId`, target environment,
+destination key, …) onto the `acfbak-backup-jobs` Cloudflare Queue, and logs the
+run start. The runner — an external Node process, not a Worker — consumes the
+queue via the Queues **HTTP pull** API, performs the Acquia→R2 transfer, and
+acknowledges the message. The Worker is declared as the queue *producer* in
+`wrangler.toml`; the pull consumer is configured out-of-band (see the deploy
+commands above).
+
+To fire a run without waiting for cron (e.g. to test the handoff), set the
+`TRIGGER_TOKEN` secret and POST to `/trigger`:
+
+```bash
+curl -X POST https://<worker-host>/trigger -H "x-acfbak-token: $TRIGGER_TOKEN"
+# → { "triggered": true, "runId": "…", "destinationKey": "acquia/prod/…/db.sql.gz" }
+```
+
+> **Remaining:** the runner's queue **pull-consume loop** (pull → run transfer →
+> ack) is tracked separately — it's the half that closes the scheduled path end
+> to end. The Worker producer side and the manual trigger are implemented here.
 
 ## Project layout
 
@@ -113,10 +140,12 @@ src/runner/acquia.ts        Acquia Cloud API v2 client (auth, list, select, down
 src/runner/r2.ts            R2 S3-compatible streaming uploader (dated key, size check)
 vitest.workspace.ts         vitest projects: unit (Node) + worker (Miniflare)
 test/unit/acquia.test.ts    Acquia client unit tests (injected fetch, offline)
+src/run.ts                  shared run-context + dated object-key (Worker ↔ runner)
 test/unit/r2.test.ts        R2 uploader unit tests (injected transport, offline)
-test/worker/r2-smoke.test.ts  R2 binding smoke test + secret-hygiene test
+test/unit/run.test.ts       run-context + Worker enqueue-handoff unit tests
+test/worker/worker.test.ts  Worker integration tests (R2 binding, scheduled handoff, /trigger)
 ```
 
 ## Status
 
-Building out capability [#1](https://github.com/paulirv/acfbak/issues/1). The runner now performs the full transfer: it discovers and retrieves the latest existing Acquia backup ([#7](https://github.com/paulirv/acfbak/issues/7)) and streams it into R2 under a dated key, verifying the stored size ([#9](https://github.com/paulirv/acfbak/issues/9)). What remains for the scheduled path is the Worker→runner cron handoff ([#8](https://github.com/paulirv/acfbak/issues/8)) — currently the Worker logs the run intent but does not yet invoke the runner. Scheduling, config, secret handling, and the R2 binding are wired and tested.
+Building out capability [#1](https://github.com/paulirv/acfbak/issues/1). The runner performs the full transfer — discover and retrieve the latest existing Acquia backup ([#7](https://github.com/paulirv/acfbak/issues/7)) and stream it into R2 under a dated key with size verification ([#9](https://github.com/paulirv/acfbak/issues/9)). The Worker now schedules runs and hands off to the runner via a Cloudflare Queue, with a manual `/trigger` path ([#8](https://github.com/paulirv/acfbak/issues/8)). The remaining piece to close the scheduled path end to end is the runner's queue pull-consume loop. Config, secret handling, and the R2 binding are wired and tested.

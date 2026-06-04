@@ -34,6 +34,9 @@ export default defineWorkspace([
           // so sharing storage within the file is safe and sidesteps the bug.
           isolatedStorage: false,
           wrangler: { configPath: "./wrangler.toml" },
+          // Inject the manual-trigger secret for tests only (never committed to
+          // wrangler.toml). In production it's set via `wrangler secret put`.
+          miniflare: { bindings: { TRIGGER_TOKEN: "test-trigger-token" } },
         },
       },
     },
