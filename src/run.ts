@@ -25,13 +25,58 @@ function utcDay(date: Date): string {
 }
 
 /**
- * Build the dated object key for a backup. Documented convention:
- *   `{keyPrefix}/{environment}/{YYYY-MM-DD}/db.sql.gz`
- * e.g. `acquia/prod/2026-06-04/db.sql.gz`. The day is the UTC calendar day of
- * `date`. Feeds retention (#4) and verification (#5).
+ * Format a Date as a UTC second-precision timestamp safe for an object-key
+ * path segment: `YYYY-MM-DDTHH-MM-SSZ` (colons → dashes), e.g.
+ * `2026-06-13T21-08-59Z`. On-demand keys use this rather than just the day so
+ * multiple on-demand runs in the same day don't collide.
  */
-export function buildObjectKey(config: AcfbakConfig, date: Date): string {
-  return `${config.r2.keyPrefix}/${config.acquia.environment}/${utcDay(date)}/db.sql.gz`;
+function utcTimestamp(date: Date): string {
+  return date.toISOString().slice(0, 19).replace(/:/g, "-") + "Z";
+}
+
+/**
+ * Slugify an optional on-demand label/reason into a key-safe segment suffix:
+ * lowercase, non-alphanumerics → single dashes, trimmed, capped at 40 chars.
+ * Returns "" when there is nothing usable (so the key omits the suffix).
+ * e.g. "pre-deploy v2.3" → "pre-deploy-v2-3".
+ */
+export function slugifyLabel(label: string | undefined): string {
+  if (!label) return "";
+  return label
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40)
+    .replace(/-+$/g, "");
+}
+
+/**
+ * Build the destination object key for a backup. The convention encodes the
+ * trigger origin (#11) so on-demand copies are distinguishable from scheduled
+ * ones in R2 — for operators browsing and for retention (#4), which can include
+ * or exclude on-demand copies by globbing the `on-demand/` segment.
+ *
+ *   scheduled  → `{keyPrefix}/{environment}/{YYYY-MM-DD}/db.sql.gz`
+ *   on-demand  → `{keyPrefix}/{environment}/on-demand/{YYYY-MM-DDTHH-MM-SSZ}[-{label}]/db.sql.gz`
+ *
+ * e.g. `acquia/prod/2026-06-04/db.sql.gz` (scheduled) vs.
+ * `acquia/prod/on-demand/2026-06-13T21-08-59Z-pre-deploy-v2-3/db.sql.gz`.
+ * Scheduled keys are unchanged (one per UTC day); on-demand keys carry a
+ * full timestamp and optional label slug so repeated manual runs never collide.
+ */
+export function buildObjectKey(
+  config: AcfbakConfig,
+  date: Date,
+  trigger: TriggerKind,
+  label?: string,
+): string {
+  const base = `${config.r2.keyPrefix}/${config.acquia.environment}`;
+  if (trigger === "scheduled") {
+    return `${base}/${utcDay(date)}/db.sql.gz`;
+  }
+  const slug = slugifyLabel(label);
+  const segment = slug ? `${utcTimestamp(date)}-${slug}` : utcTimestamp(date);
+  return `${base}/on-demand/${segment}/db.sql.gz`;
 }
 
 /**
@@ -45,6 +90,12 @@ export interface BackupRunContext {
   runId: string;
   /** What initiated this run — a scheduled cron fire or an on-demand trigger. */
   trigger: TriggerKind;
+  /**
+   * Optional human label/reason for an on-demand run (e.g. "pre-deploy v2.3").
+   * Slugified into the destination key; omitted for scheduled runs. Carried so
+   * the runner and history (#13) can record the operator's intent verbatim.
+   */
+  label?: string;
   /** Acquia application (subscription) name or UUID to pull from. */
   application: string;
   /** Acquia environment to back up (e.g. prod). */
@@ -57,20 +108,27 @@ export interface BackupRunContext {
   enqueuedAt: string;
 }
 
-/** Assemble the run context the Worker enqueues for a given run id and time. */
+/**
+ * Assemble the run context the Worker enqueues for a given run id and time. An
+ * optional `label` (on-demand only) is recorded on the context and folded into
+ * the destination key so the artifact is self-describing.
+ */
 export function buildRunContext(
   config: AcfbakConfig,
   date: Date,
   runId: string,
   trigger: TriggerKind,
+  label?: string,
 ): BackupRunContext {
   return {
     runId,
     trigger,
+    // Only attach a label for on-demand runs, and only when non-empty.
+    ...(trigger === "on-demand" && label ? { label } : {}),
     application: config.acquia.applicationName,
     environment: config.acquia.environment,
     database: config.acquia.database,
-    destinationKey: buildObjectKey(config, date),
+    destinationKey: buildObjectKey(config, date, trigger, label),
     enqueuedAt: date.toISOString(),
   };
 }

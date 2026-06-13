@@ -29,6 +29,18 @@ describe("buildRunContext (AC-03)", () => {
     expect(scheduled.trigger).toBe("scheduled");
     expect(onDemand.trigger).toBe("on-demand");
   });
+
+  it("folds an on-demand label into both the context and the key (#11)", () => {
+    const ctx = buildRunContext(config, new Date("2026-06-13T21:08:59Z"), "r3", "on-demand", "pre-deploy v2.3");
+    expect(ctx.label).toBe("pre-deploy v2.3");
+    expect(ctx.destinationKey).toBe("acquia/prod/on-demand/2026-06-13T21-08-59Z-pre-deploy-v2-3/db.sql.gz");
+  });
+
+  it("does not attach a label to scheduled runs even if one is passed (#11)", () => {
+    const ctx = buildRunContext(config, new Date("2026-06-13T03:00:00Z"), "r4", "scheduled", "ignored");
+    expect(ctx.label).toBeUndefined();
+    expect(ctx.destinationKey).toBe("acquia/prod/2026-06-13/db.sql.gz");
+  });
 });
 
 describe("enqueueBackupRun (AC-02 / AC-03)", () => {

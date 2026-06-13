@@ -9,6 +9,7 @@ import {
   R2UploadError,
   type R2Transport,
 } from "../../src/runner/r2.ts";
+import { slugifyLabel } from "../../src/run.ts";
 import type { AcfbakConfig } from "../../src/config.ts";
 
 const config: AcfbakConfig = {
@@ -48,14 +49,56 @@ describe("requireR2Credentials", () => {
 
 describe("buildObjectKey (AC-02)", () => {
   it("uses the documented {keyPrefix}/{env}/{YYYY-MM-DD}/db.sql.gz convention (UTC)", () => {
-    const key = buildObjectKey(config, new Date("2026-06-04T03:05:00Z"));
+    const key = buildObjectKey(config, new Date("2026-06-04T03:05:00Z"), "scheduled");
     expect(key).toBe("acquia/prod/2026-06-04/db.sql.gz");
   });
 
   it("uses the UTC calendar day, not local time", () => {
     // 2026-06-04T23:30:00-05:00 is 2026-06-05T04:30Z → UTC day is the 5th.
-    const key = buildObjectKey(config, new Date("2026-06-04T23:30:00-05:00"));
+    const key = buildObjectKey(config, new Date("2026-06-04T23:30:00-05:00"), "scheduled");
     expect(key).toBe("acquia/prod/2026-06-05/db.sql.gz");
+  });
+});
+
+// #11: on-demand artifacts are distinguishable from scheduled ones by key.
+describe("buildObjectKey — on-demand distinction (#11)", () => {
+  it("nests on-demand runs under an on-demand/ segment with a full UTC timestamp", () => {
+    const key = buildObjectKey(config, new Date("2026-06-13T21:08:59Z"), "on-demand");
+    expect(key).toBe("acquia/prod/on-demand/2026-06-13T21-08-59Z/db.sql.gz");
+  });
+
+  it("appends a slugified label when one is given", () => {
+    const key = buildObjectKey(config, new Date("2026-06-13T21:08:59Z"), "on-demand", "pre-deploy v2.3");
+    expect(key).toBe("acquia/prod/on-demand/2026-06-13T21-08-59Z-pre-deploy-v2-3/db.sql.gz");
+  });
+
+  it("does not collide for two on-demand runs in the same UTC day", () => {
+    const a = buildObjectKey(config, new Date("2026-06-13T09:00:00Z"), "on-demand");
+    const b = buildObjectKey(config, new Date("2026-06-13T17:30:00Z"), "on-demand");
+    expect(a).not.toBe(b);
+  });
+
+  it("keeps the on-demand/ marker so retention (#4) can glob include/exclude", () => {
+    const scheduled = buildObjectKey(config, new Date("2026-06-13T03:00:00Z"), "scheduled");
+    const onDemand = buildObjectKey(config, new Date("2026-06-13T21:08:59Z"), "on-demand");
+    expect(scheduled).not.toContain("/on-demand/");
+    expect(onDemand).toContain("/on-demand/");
+  });
+});
+
+describe("slugifyLabel (#11)", () => {
+  it("lowercases, collapses non-alphanumerics to dashes, and trims", () => {
+    expect(slugifyLabel("Pre-Deploy v2.3!")).toBe("pre-deploy-v2-3");
+  });
+
+  it("returns empty for undefined or unusable input", () => {
+    expect(slugifyLabel(undefined)).toBe("");
+    expect(slugifyLabel("   ")).toBe("");
+    expect(slugifyLabel("---")).toBe("");
+  });
+
+  it("caps the slug length", () => {
+    expect(slugifyLabel("a".repeat(100)).length).toBeLessThanOrEqual(40);
   });
 });
 

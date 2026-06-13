@@ -108,7 +108,37 @@ describe("manual /trigger (AC-04)", () => {
     // The on-demand origin is reported on the response and carried into the
     // handoff context (#10) so it is identifiable downstream.
     expect(body.trigger).toBe("on-demand");
-    expect(body.destinationKey).toMatch(/^acquia\/prod\/\d{4}-\d{2}-\d{2}\/db\.sql\.gz$/);
+    // On-demand artifacts land under an on-demand/ segment with a timestamp (#11)
+    // so they don't collide with — and are distinguishable from — scheduled ones.
+    expect(body.destinationKey).toMatch(
+      /^acquia\/prod\/on-demand\/\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\/db\.sql\.gz$/,
+    );
+  });
+
+  it("folds an on-demand label (JSON body) into the key and response (#11)", async () => {
+    const res = await SELF.fetch("https://acfbak.test/trigger", {
+      method: "POST",
+      headers: { "x-acfbak-token": "test-trigger-token", "content-type": "application/json" },
+      body: JSON.stringify({ label: "pre-deploy v2.3" }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { label?: string; destinationKey: string };
+    expect(body.label).toBe("pre-deploy v2.3");
+    expect(body.destinationKey).toMatch(
+      /^acquia\/prod\/on-demand\/\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z-pre-deploy-v2-3\/db\.sql\.gz$/,
+    );
+  });
+
+  it("accepts an on-demand label via the ?label= query param (#11)", async () => {
+    const res = await SELF.fetch("https://acfbak.test/trigger?label=hotfix%20A", {
+      method: "POST",
+      headers: { "x-acfbak-token": "test-trigger-token" },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { label?: string; destinationKey: string };
+    expect(body.label).toBe("hotfix A");
+    expect(body.destinationKey).toContain("/on-demand/");
+    expect(body.destinationKey).toContain("-hotfix-a/");
   });
 
   it("reports manualTriggerEnabled on /health without leaking the token", async () => {

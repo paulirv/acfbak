@@ -60,8 +60,9 @@ export async function enqueueBackupRun(
   now: Date,
   runId: string,
   trigger: TriggerKind,
+  label?: string,
 ): Promise<BackupRunContext> {
-  const context = buildRunContext(config, now, runId, trigger);
+  const context = buildRunContext(config, now, runId, trigger, label);
   await queue.send(context);
   return context;
 }
@@ -95,6 +96,31 @@ export async function writeSmokeObject(env: Env): Promise<string> {
     throw new Error(`R2 smoke write failed: could not read back ${key}`);
   }
   return key;
+}
+
+/**
+ * Extract an optional on-demand label/reason from a `/trigger` request (#11).
+ * Accepts either a `?label=` query param or a JSON body `{ "label": "..." }`;
+ * the query param wins if both are present. Parsing is best-effort — a missing
+ * or malformed body is not an error (the label is optional), so this never
+ * throws and a bad body simply yields no label. Returns undefined when absent.
+ */
+export async function readTriggerLabel(request: Request, url: URL): Promise<string | undefined> {
+  const fromQuery = url.searchParams.get("label");
+  if (fromQuery && fromQuery.trim()) return fromQuery.trim();
+
+  const contentType = request.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) return undefined;
+  try {
+    const body: unknown = await request.json();
+    if (body && typeof body === "object" && "label" in body) {
+      const label = (body as { label: unknown }).label;
+      if (typeof label === "string" && label.trim()) return label.trim();
+    }
+  } catch {
+    // Malformed JSON body — the label is optional, so ignore and proceed.
+  }
+  return undefined;
 }
 
 export default {
@@ -159,10 +185,11 @@ export default {
         return Response.json({ error: "unauthorized" }, { status: 401 });
       }
 
+      const label = await readTriggerLabel(request, url);
       const runId = crypto.randomUUID();
-      const context = await enqueueBackupRun(env.BACKUP_QUEUE, new Date(), runId, "on-demand");
+      const context = await enqueueBackupRun(env.BACKUP_QUEUE, new Date(), runId, "on-demand", label);
       console.log(
-        `[acfbak] on-demand run ${runId} — enqueued handoff ` +
+        `[acfbak] on-demand run ${runId}${context.label ? ` "${context.label}"` : ""} — enqueued handoff ` +
           `source=${context.application}/${context.environment} ` +
           `dest=r2://${config.r2.bucket}/${context.destinationKey}`,
       );
@@ -170,6 +197,7 @@ export default {
         triggered: true,
         runId,
         trigger: context.trigger,
+        ...(context.label ? { label: context.label } : {}),
         destinationKey: context.destinationKey,
       });
     }

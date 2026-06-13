@@ -120,6 +120,11 @@ export async function performTransfer(
  * One-shot transfer entry (`npm run runner`). Pulls the latest backup for the
  * configured app/env and stores it under today's dated key. Use this for a
  * standalone/manual run; the queue-driven path is {@link runConsumer}.
+ *
+ * This writes the canonical daily (scheduled-style) key on purpose: it's a
+ * direct dev/recovery transfer to the standard slot, distinct from the
+ * product's on-demand trigger (the Worker's `/trigger`, which keys runs under
+ * `on-demand/` — see {@link buildObjectKey}).
  */
 export async function main(): Promise<void> {
   const config = loadConfig();
@@ -127,7 +132,8 @@ export async function main(): Promise<void> {
   const r2Creds = requireR2Credentials();
   const transport = s3Transport(makeR2Client(r2Creds));
 
-  await performTransfer(config, buildObjectKey(config, new Date()), acquiaCreds, transport, "manual");
+  const key = buildObjectKey(config, new Date(), "scheduled");
+  await performTransfer(config, key, acquiaCreds, transport, "manual");
 }
 
 /** Build an effective config for one run, overriding the source from its context. */

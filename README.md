@@ -129,16 +129,43 @@ run is marked with its origin (`trigger: "scheduled"` or `"on-demand"`) so the
 two are distinguishable in logs and the handoff message.
 
 Set the `TRIGGER_TOKEN` secret (unset ⇒ the endpoint is disabled, `503`) and POST
-with the matching token header:
+with the matching token header. An optional **label/reason** can be attached —
+via a `?label=` query param or a JSON body — and is folded into the object key:
 
 ```bash
+# Bare on-demand backup:
 curl -X POST https://<worker-host>/trigger -H "x-acfbak-token: $TRIGGER_TOKEN"
-# → { "triggered": true, "runId": "…", "trigger": "on-demand", "destinationKey": "acquia/prod/…/db.sql.gz" }
+# → { "triggered": true, "runId": "…", "trigger": "on-demand",
+#     "destinationKey": "acquia/prod/on-demand/2026-06-13T21-08-59Z/db.sql.gz" }
+
+# Labelled (e.g. a pre-deploy snapshot):
+curl -X POST "https://<worker-host>/trigger" \
+  -H "x-acfbak-token: $TRIGGER_TOKEN" -H "content-type: application/json" \
+  -d '{"label":"pre-deploy v2.3"}'
+# → destinationKey: "acquia/prod/on-demand/2026-06-13T21-08-59Z-pre-deploy-v2-3/db.sql.gz"
 ```
 
 The endpoint is access-controlled — token-gated and fail-closed (non-`POST` ⇒
 `405`, missing or wrong token ⇒ `401`) — so it can't be invoked anonymously. The
 minted `runId` correlates the Worker log, the runner log, and the R2 artifact.
+
+#### Object-key convention (and retention)
+
+The destination key encodes the run's origin so on-demand copies are
+distinguishable from scheduled ones in R2 ([#11](https://github.com/paulirv/acfbak/issues/11)):
+
+| Origin | Key | Notes |
+|--------|-----|-------|
+| **scheduled** | `{keyPrefix}/{env}/{YYYY-MM-DD}/db.sql.gz` | One per UTC day — the canonical daily slot. |
+| **on-demand** | `{keyPrefix}/{env}/on-demand/{YYYY-MM-DDTHH-MM-SSZ}[-{label}]/db.sql.gz` | Nested under `on-demand/`; full second-precision timestamp + optional label slug, so repeated manual runs never collide. |
+
+The `on-demand/` path segment is the **retention marker**: when retention
+([#4](https://github.com/paulirv/acfbak/issues/4)) lands it can include or
+exclude on-demand copies intentionally by globbing `*/on-demand/*` — e.g. expire
+scheduled dailies on a rolling window while keeping (or separately pruning)
+pre-deploy snapshots. A standalone `npm run runner` writes the **scheduled**
+daily key on purpose (it's a direct dev/recovery transfer to the standard slot),
+distinct from the product's on-demand `/trigger` path.
 
 #### Running the consumer
 
