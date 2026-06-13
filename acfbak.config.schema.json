@@ -71,6 +71,19 @@
           "description": "Documentation-only timezone label. Cloudflare cron triggers run in UTC."
         }
       }
+    },
+    "notifications": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-run success/failure notifications. Optional; defaults to the console channel. The webhook destination is supplied as the NOTIFY_WEBHOOK_URL secret, never here.",
+      "properties": {
+        "channel": {
+          "type": "string",
+          "enum": ["console", "webhook"],
+          "default": "console",
+          "description": "Where terminal run signals are sent. 'console' logs to stdout/stderr; 'webhook' additionally POSTs a Slack-compatible { text } payload to NOTIFY_WEBHOOK_URL."
+        }
+      }
     }
   }
 }

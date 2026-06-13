@@ -33,10 +33,24 @@ export interface BackupSchedule {
   timezone: string;
 }
 
+/** Where per-run success/failure notifications are sent (#12). */
+export type NotificationChannel = "console" | "webhook";
+
+export interface NotificationSettings {
+  /**
+   * Notification channel. "console" (default) logs the terminal signal to
+   * stdout/stderr; "webhook" additionally POSTs a `{ text }` payload to the
+   * `NOTIFY_WEBHOOK_URL` secret (Slack-compatible; relays cover Telegram/email).
+   */
+  channel: NotificationChannel;
+}
+
 export interface AcfbakConfig {
   acquia: AcquiaSource;
   r2: R2Destination;
   schedule: BackupSchedule;
+  /** Per-run notifications. Optional; defaults to the console channel. */
+  notifications?: NotificationSettings;
 }
 
 export class ConfigError extends Error {
@@ -103,5 +117,25 @@ export function validateConfig(raw: unknown): AcfbakConfig {
       cron: requireString(raw.schedule, "cron", "schedule.cron"),
       timezone: optionalString(raw.schedule, "timezone", "schedule.timezone", "UTC"),
     },
+    ...validateNotifications(raw.notifications),
   };
+}
+
+/**
+ * Validate the optional `notifications` block (#12). Absent ⇒ omitted from the
+ * config (callers default to the console channel). Present ⇒ `channel` must be
+ * one of the known values. Returns a partial so the field is only set when
+ * configured, keeping the default implicit.
+ */
+function validateNotifications(raw: unknown): Pick<AcfbakConfig, "notifications"> {
+  if (raw === undefined) return {};
+  if (!isRecord(raw)) throw new ConfigError('"notifications" must be an object when present');
+
+  const channel = optionalString(raw, "channel", "notifications.channel", "console");
+  if (channel !== "console" && channel !== "webhook") {
+    throw new ConfigError(
+      `"notifications.channel" must be "console" or "webhook" (got "${channel}")`,
+    );
+  }
+  return { notifications: { channel } };
 }
