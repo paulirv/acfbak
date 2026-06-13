@@ -109,22 +109,36 @@ The cron trigger in `wrangler.toml` schedules the orchestrator Worker.
 
 ### Scheduling & Worker→runner handoff
 
-The Worker owns timing only. On each scheduled run (and on a manual trigger) it
-mints a `runId`, enqueues a **run context** (`runId`, target environment,
-destination key, …) onto the `acfbak-backup-jobs` Cloudflare Queue, and logs the
-run start. The runner — an external Node process, not a Worker — consumes the
-queue via the Queues **HTTP pull** API, performs the Acquia→R2 transfer, and
-acknowledges the message. The Worker is declared as the queue *producer* in
-`wrangler.toml`; the pull consumer is configured out-of-band (see the deploy
-commands above).
+The Worker owns timing only. On each scheduled run (and on an on-demand trigger)
+it mints a `runId`, enqueues a **run context** (`runId`, `trigger` origin, target
+environment, destination key, …) onto the `acfbak-backup-jobs` Cloudflare Queue,
+and logs the run start. The runner — an external Node process, not a Worker —
+consumes the queue via the Queues **HTTP pull** API, performs the Acquia→R2
+transfer, and acknowledges the message. The Worker is declared as the queue
+*producer* in `wrangler.toml`; the pull consumer is configured out-of-band (see
+the deploy commands above).
 
-To fire a run without waiting for cron (e.g. to test the handoff), set the
-`TRIGGER_TOKEN` secret and POST to `/trigger`:
+### On-demand backups
+
+Backups also run **on demand**, not only on the cron schedule
+([#10](https://github.com/paulirv/acfbak/issues/10)). The on-demand path is the
+authenticated `POST /trigger` endpoint — a first-class backup trigger, not a
+divergent code path: it enqueues the **exact same** run context the scheduled
+handler does (`enqueueBackupRun`), so there is a single trusted pipeline. Each
+run is marked with its origin (`trigger: "scheduled"` or `"on-demand"`) so the
+two are distinguishable in logs and the handoff message.
+
+Set the `TRIGGER_TOKEN` secret (unset ⇒ the endpoint is disabled, `503`) and POST
+with the matching token header:
 
 ```bash
 curl -X POST https://<worker-host>/trigger -H "x-acfbak-token: $TRIGGER_TOKEN"
-# → { "triggered": true, "runId": "…", "destinationKey": "acquia/prod/…/db.sql.gz" }
+# → { "triggered": true, "runId": "…", "trigger": "on-demand", "destinationKey": "acquia/prod/…/db.sql.gz" }
 ```
+
+The endpoint is access-controlled — token-gated and fail-closed (non-`POST` ⇒
+`405`, missing or wrong token ⇒ `401`) — so it can't be invoked anonymously. The
+minted `runId` correlates the Worker log, the runner log, and the R2 artifact.
 
 #### Running the consumer
 

@@ -100,10 +100,14 @@ describe("manual /trigger (AC-04)", () => {
     const body = (await res.json()) as {
       triggered: boolean;
       runId: string;
+      trigger: string;
       destinationKey: string;
     };
     expect(body.triggered).toBe(true);
     expect(body.runId).toBeTruthy();
+    // The on-demand origin is reported on the response and carried into the
+    // handoff context (#10) so it is identifiable downstream.
+    expect(body.trigger).toBe("on-demand");
     expect(body.destinationKey).toMatch(/^acquia\/prod\/\d{4}-\d{2}-\d{2}\/db\.sql\.gz$/);
   });
 

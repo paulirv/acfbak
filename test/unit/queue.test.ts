@@ -46,7 +46,7 @@ function recordingFetch(responder: (url: string, init?: RequestInit) => Response
 
 /** Encode a run context the way the Worker producer (json content type) does. */
 function encodedMessage(runId: string, leaseId: string) {
-  const ctx = buildRunContext(config, new Date("2026-06-04T03:00:00Z"), runId);
+  const ctx = buildRunContext(config, new Date("2026-06-04T03:00:00Z"), runId, "scheduled");
   return {
     id: `msg-${runId}`,
     lease_id: leaseId,
@@ -166,6 +166,7 @@ function fakeConsumer(messages: PulledMessage[]): {
 function message(runId: string, leaseId: string): PulledMessage {
   const context: BackupRunContext = {
     runId,
+    trigger: "scheduled",
     application: "my-drupal-app",
     environment: "prod",
     database: "default",

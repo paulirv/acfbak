@@ -162,7 +162,7 @@ export async function runConsumer(): Promise<void> {
       context.destinationKey,
       acquiaCreds,
       transport,
-      `run ${context.runId}`,
+      `run ${context.runId} (${context.trigger})`,
     );
   });
 

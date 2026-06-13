@@ -11,15 +11,23 @@ const config: AcfbakConfig = {
 
 describe("buildRunContext (AC-03)", () => {
   it("carries the full run context the runner needs", () => {
-    const ctx = buildRunContext(config, new Date("2026-06-04T03:00:00Z"), "run-123");
+    const ctx = buildRunContext(config, new Date("2026-06-04T03:00:00Z"), "run-123", "scheduled");
     expect(ctx).toEqual<BackupRunContext>({
       runId: "run-123",
+      trigger: "scheduled",
       application: "my-drupal-app",
       environment: "prod",
       database: "default",
       destinationKey: "acquia/prod/2026-06-04/db.sql.gz",
       enqueuedAt: "2026-06-04T03:00:00.000Z",
     });
+  });
+
+  it("records the trigger origin so on-demand runs are identifiable (#10)", () => {
+    const scheduled = buildRunContext(config, new Date("2026-06-04T03:00:00Z"), "r1", "scheduled");
+    const onDemand = buildRunContext(config, new Date("2026-06-04T09:00:00Z"), "r2", "on-demand");
+    expect(scheduled.trigger).toBe("scheduled");
+    expect(onDemand.trigger).toBe("on-demand");
   });
 });
 
@@ -32,12 +40,27 @@ describe("enqueueBackupRun (AC-02 / AC-03)", () => {
       },
     };
 
-    const ctx = await enqueueBackupRun(queue, new Date("2026-06-04T03:00:00Z"), "run-abc");
+    const ctx = await enqueueBackupRun(queue, new Date("2026-06-04T03:00:00Z"), "run-abc", "scheduled");
 
     expect(sent).toHaveLength(1);
     expect(sent[0]).toBe(ctx);
     expect(ctx.runId).toBe("run-abc");
+    expect(ctx.trigger).toBe("scheduled");
     expect(ctx.destinationKey).toBe("acquia/prod/2026-06-04/db.sql.gz");
+  });
+
+  it("marks an on-demand run on the enqueued context (#10)", async () => {
+    const sent: BackupRunContext[] = [];
+    const queue: BackupQueueProducer = {
+      async send(message) {
+        sent.push(message);
+      },
+    };
+
+    const ctx = await enqueueBackupRun(queue, new Date("2026-06-04T09:00:00Z"), "run-od", "on-demand");
+
+    expect(ctx.trigger).toBe("on-demand");
+    expect(sent[0]!.trigger).toBe("on-demand");
   });
 
   it("propagates a queue send failure", async () => {
@@ -46,6 +69,8 @@ describe("enqueueBackupRun (AC-02 / AC-03)", () => {
         throw new Error("queue unavailable");
       },
     };
-    await expect(enqueueBackupRun(queue, new Date(), "run-x")).rejects.toThrow("queue unavailable");
+    await expect(enqueueBackupRun(queue, new Date(), "run-x", "scheduled")).rejects.toThrow(
+      "queue unavailable",
+    );
   });
 });

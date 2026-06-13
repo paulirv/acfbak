@@ -15,7 +15,7 @@
 
 import rawConfig from "../../acfbak.config.json";
 import { validateConfig, type AcfbakConfig } from "../config";
-import { buildRunContext, type BackupRunContext } from "../run";
+import { buildRunContext, type BackupRunContext, type TriggerKind } from "../run";
 
 export interface Env {
   /** Destination R2 bucket — see wrangler.toml [[r2_buckets]]. */
@@ -49,17 +49,19 @@ export interface BackupQueueProducer {
 const config: AcfbakConfig = validateConfig(rawConfig);
 
 /**
- * Initiate a backup run: build the run context for `now` + `runId` and enqueue
- * it for the runner (the Worker→runner handoff). Returns the enqueued context
- * so the caller can log/correlate it. The queue is passed in (not read from a
- * closure) so this is unit-testable with a fake producer.
+ * Initiate a backup run: build the run context for `now` + `runId` (marked with
+ * its `trigger` origin) and enqueue it for the runner (the Worker→runner
+ * handoff). Returns the enqueued context so the caller can log/correlate it. The
+ * queue is passed in (not read from a closure) so this is unit-testable with a
+ * fake producer.
  */
 export async function enqueueBackupRun(
   queue: BackupQueueProducer,
   now: Date,
   runId: string,
+  trigger: TriggerKind,
 ): Promise<BackupRunContext> {
-  const context = buildRunContext(config, now, runId);
+  const context = buildRunContext(config, now, runId, trigger);
   await queue.send(context);
   return context;
 }
@@ -104,7 +106,7 @@ export default {
    */
   async scheduled(event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     const runId = crypto.randomUUID();
-    const context = await enqueueBackupRun(env.BACKUP_QUEUE, new Date(), runId);
+    const context = await enqueueBackupRun(env.BACKUP_QUEUE, new Date(), runId, "scheduled");
     console.log(
       `[acfbak] scheduled run ${runId} @ cron "${event.cron}" — enqueued handoff ` +
         `source=${context.application}/${context.environment} ` +
@@ -138,9 +140,11 @@ export default {
       });
     }
 
-    // Manual invoke path (AC-04): fire a run now without waiting for cron, for
-    // testing the handoff. Token-gated and fail-closed — it enqueues the same
-    // run context the scheduled handler does.
+    // On-demand backup trigger (capability #2, #10): fire a run now without
+    // waiting for cron. This is a first-class backup path, not just a test hook
+    // — it is token-gated, fail-closed, and enqueues the exact same run context
+    // the scheduled handler does, marked `trigger: "on-demand"` so the origin is
+    // identifiable downstream (logs, R2 artifact #11, history #13).
     if (url.pathname === "/trigger") {
       if (request.method !== "POST") {
         return Response.json({ error: "method not allowed; use POST" }, { status: 405 });
@@ -156,15 +160,16 @@ export default {
       }
 
       const runId = crypto.randomUUID();
-      const context = await enqueueBackupRun(env.BACKUP_QUEUE, new Date(), runId);
+      const context = await enqueueBackupRun(env.BACKUP_QUEUE, new Date(), runId, "on-demand");
       console.log(
-        `[acfbak] manual run ${runId} — enqueued handoff ` +
+        `[acfbak] on-demand run ${runId} — enqueued handoff ` +
           `source=${context.application}/${context.environment} ` +
           `dest=r2://${config.r2.bucket}/${context.destinationKey}`,
       );
       return Response.json({
         triggered: true,
         runId,
+        trigger: context.trigger,
         destinationKey: context.destinationKey,
       });
     }

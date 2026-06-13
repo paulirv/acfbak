@@ -11,6 +11,14 @@
 
 import type { AcfbakConfig } from "./config.ts";
 
+/**
+ * What initiated a backup run. Both kinds flow through the exact same
+ * orchestration + transfer code (the "single trusted backup path"); the marker
+ * only records the origin so an on-demand run is identifiable in logs, the
+ * handoff message, and — later — the stored artifact (#11) and history (#13).
+ */
+export type TriggerKind = "scheduled" | "on-demand";
+
 /** Format a Date as a UTC `YYYY-MM-DD` calendar day. */
 function utcDay(date: Date): string {
   return date.toISOString().slice(0, 10);
@@ -35,6 +43,8 @@ export function buildObjectKey(config: AcfbakConfig, date: Date): string {
 export interface BackupRunContext {
   /** Unique id for this run, for correlating Worker logs ↔ runner logs ↔ R2. */
   runId: string;
+  /** What initiated this run — a scheduled cron fire or an on-demand trigger. */
+  trigger: TriggerKind;
   /** Acquia application (subscription) name or UUID to pull from. */
   application: string;
   /** Acquia environment to back up (e.g. prod). */
@@ -52,9 +62,11 @@ export function buildRunContext(
   config: AcfbakConfig,
   date: Date,
   runId: string,
+  trigger: TriggerKind,
 ): BackupRunContext {
   return {
     runId,
+    trigger,
     application: config.acquia.applicationName,
     environment: config.acquia.environment,
     database: config.acquia.database,
