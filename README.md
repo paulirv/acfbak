@@ -182,7 +182,8 @@ message to that message's destination key, acks the successes, and marks any
 failures for retry (the queue redelivers them). One-shot by design — run it on a
 schedule on the runner host (e.g. a cron job / CI workflow), or wrap it in a loop
 for an always-on consumer. A bare `npm run runner` instead does a single
-standalone transfer under today's dated key without touching the queue.
+standalone transfer under today's dated key without touching the queue, and
+`npm run runner -- --history` prints recent run records (see [Run history](#run-history)).
 
 ### Per-run notifications
 
@@ -212,6 +213,35 @@ but never flips a run's real outcome, and the console record is always written
 too. Selecting `webhook` without `NOTIFY_WEBHOOK_URL` fails loud at startup
 (before any transfer), so a misconfiguration can't cause a silent run.
 
+### Run history
+
+Beyond the per-run notification, every run **appends a durable record** so an
+operator can audit backup health over time ([#13](https://github.com/paulirv/acfbak/issues/13)).
+Each record captures the run id, trigger (`scheduled` / `on-demand`), outcome,
+size, duration, Acquia source backup id, destination key, and timestamp.
+
+The store is **append-only in R2** — one small JSON object per run, no database:
+
+```
+{keyPrefix}/_history/{YYYY-MM}/{timestamp}-{runId}.json
+```
+
+Per-run objects (rather than a single shared manifest) avoid a read-modify-write
+race; the month shard + timestamp prefix keep listings bounded and chronological.
+Recording is best-effort — a history-write failure is logged but never flips the
+backup's real outcome.
+
+Retrieve the most recent runs (default 20) with the runner:
+
+```bash
+npm run runner -- --history        # last 20 runs, newest first
+npm run runner -- --history 50     # last 50
+```
+
+This is read-only (no transfer) and needs only the R2 credentials. `list` scans
+the newest month shards until it has enough records, so a long history never
+forces a full-bucket listing.
+
 ## Project layout
 
 ```
@@ -223,21 +253,25 @@ vitest.workspace.ts         vitest projects: unit (Node) + worker (Miniflare)
 src/config.ts               shared config types + validator (env-agnostic)
 src/run.ts                  shared run-context + object-key convention (Worker ↔ runner)
 src/notify.ts               per-run notification events + console/webhook channels (env-agnostic)
+src/history.ts              run-history record shape + key convention + store contract (env-agnostic)
 src/worker/index.ts         orchestrator Worker (scheduled + fetch handlers, queue producer)
-src/runner/index.ts         transfer runner entry (one-shot + --consume queue drain, notifications)
+src/runner/index.ts         transfer runner entry (one-shot + --consume drain + --history, observers)
 src/runner/acquia.ts        Acquia Cloud API v2 client (auth, list, select, download)
 src/runner/r2.ts            R2 S3-compatible streaming uploader (dated key, size check)
 src/runner/queue.ts         Cloudflare Queues HTTP pull/ack client + drain loop
+src/runner/history-store.ts R2-backed append-only run-history store (S3 put/list/get)
 test/unit/acquia.test.ts    Acquia client unit tests (injected fetch, offline)
 test/unit/r2.test.ts        R2 uploader + object-key unit tests (injected transport, offline)
 test/unit/run.test.ts       run-context + Worker enqueue-handoff unit tests
 test/unit/queue.test.ts     queue client + drain orchestration unit tests (offline)
 test/unit/config.test.ts    config validator unit tests (notifications block)
 test/unit/notify.test.ts    notification channels + resolver unit tests (offline)
-test/unit/runner.test.ts    per-run notification + transfer-stage unit tests (mocked Acquia)
+test/unit/history.test.ts   run-record builders + key convention + in-memory store tests
+test/unit/history-store.test.ts  R2 history store tests (in-memory transport, offline)
+test/unit/runner.test.ts    observeRun (notify + history) + transfer-stage tests (mocked Acquia)
 test/worker/worker.test.ts  Worker integration tests (R2 binding, scheduled handoff, /trigger)
 ```
 
 ## Status
 
-The scheduled daily backup ([#1](https://github.com/paulirv/acfbak/issues/1)) is wired end to end: the Worker fires on cron, mints a run id, and hands off to the runner via a Cloudflare Queue, with a token-gated manual `/trigger` path ([#8](https://github.com/paulirv/acfbak/issues/8)). The runner consumes the queue ([#27](https://github.com/paulirv/acfbak/issues/27)), pulls the latest existing Acquia backup ([#7](https://github.com/paulirv/acfbak/issues/7)), and streams it into R2 under a dated key with size verification ([#9](https://github.com/paulirv/acfbak/issues/9)). On-demand backups ([#2](https://github.com/paulirv/acfbak/issues/2)) run through the same pipeline via the first-class `/trigger` path ([#10](https://github.com/paulirv/acfbak/issues/10)), keyed distinctly under `on-demand/` ([#11](https://github.com/paulirv/acfbak/issues/11)). Each run emits exactly one success/failure notification ([#12](https://github.com/paulirv/acfbak/issues/12)) over a configurable console/webhook channel. All component paths are unit/integration tested; a live end-to-end run awaits provisioned Acquia + Cloudflare credentials. Next: more observability & alerting ([#3](https://github.com/paulirv/acfbak/issues/3)) — run history ([#13](https://github.com/paulirv/acfbak/issues/13)) and missed-run detection ([#14](https://github.com/paulirv/acfbak/issues/14)).
+The scheduled daily backup ([#1](https://github.com/paulirv/acfbak/issues/1)) is wired end to end: the Worker fires on cron, mints a run id, and hands off to the runner via a Cloudflare Queue, with a token-gated manual `/trigger` path ([#8](https://github.com/paulirv/acfbak/issues/8)). The runner consumes the queue ([#27](https://github.com/paulirv/acfbak/issues/27)), pulls the latest existing Acquia backup ([#7](https://github.com/paulirv/acfbak/issues/7)), and streams it into R2 under a dated key with size verification ([#9](https://github.com/paulirv/acfbak/issues/9)). On-demand backups ([#2](https://github.com/paulirv/acfbak/issues/2)) run through the same pipeline via the first-class `/trigger` path ([#10](https://github.com/paulirv/acfbak/issues/10)), keyed distinctly under `on-demand/` ([#11](https://github.com/paulirv/acfbak/issues/11)). Each run emits exactly one success/failure notification ([#12](https://github.com/paulirv/acfbak/issues/12)) over a configurable console/webhook channel and appends a durable run-history record in R2, retrievable via `npm run runner -- --history` ([#13](https://github.com/paulirv/acfbak/issues/13)). All component paths are unit/integration tested; a live end-to-end run awaits provisioned Acquia + Cloudflare credentials. Next: missed-run / heartbeat detection ([#14](https://github.com/paulirv/acfbak/issues/14)) closes out the observability capability ([#3](https://github.com/paulirv/acfbak/issues/3)).

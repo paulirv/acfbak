@@ -42,9 +42,11 @@ import { resolveNotifier, type Notifier, type TransferStage } from "../notify.ts
 import {
   successRecord,
   failureRecord,
+  formatHistory,
   type HistoryStore,
   type RunRecord,
 } from "../history.ts";
+import { s3HistoryTransport, r2HistoryStore } from "./history-store.ts";
 import { randomUUID } from "node:crypto";
 
 /** Load and validate acfbak.config.json from the repo root. */
@@ -277,15 +279,17 @@ export async function main(): Promise<void> {
   const config = loadConfig();
   const acquiaCreds = requireAcquiaCredentials();
   const r2Creds = requireR2Credentials();
-  const transport = s3Transport(makeR2Client(r2Creds));
+  const client = makeR2Client(r2Creds);
+  const transport = s3Transport(client);
   // Resolve the notifier up front so a webhook misconfiguration fails before the
   // transfer rather than leaving the run's outcome unreported.
   const notifier = resolveNotifier(config);
+  const history = r2HistoryStore(s3HistoryTransport(client), config);
 
   // A standalone run still gets a run id + context so it emits the same terminal
   // signal as a queue-driven one (no silent outcomes, #12) and records history (#13).
   const context = buildRunContext(config, new Date(), randomUUID(), "scheduled");
-  await observeRun({ notifier }, context, () =>
+  await observeRun({ notifier, history }, context, () =>
     performTransfer(config, context.destinationKey, acquiaCreds, transport, `run ${context.runId} (manual)`),
   );
 }
@@ -314,15 +318,17 @@ export async function runConsumer(): Promise<void> {
   const queueCreds = requireQueueCredentials();
 
   const client = new QueuePullClient(queueCreds, fetch);
-  const transport = s3Transport(makeR2Client(r2Creds));
+  const r2Client = makeR2Client(r2Creds);
+  const transport = s3Transport(r2Client);
   // Resolve once before draining so a webhook misconfiguration fails the pass up
   // front rather than per message.
   const notifier = resolveNotifier(config);
+  const history = r2HistoryStore(s3HistoryTransport(r2Client), config);
 
   const summary = await drainQueueOnce(client, async (context) => {
     // One terminal signal per message to all observers (#12 notify, #13 history);
     // the rethrow on failure still lets drainQueueOnce mark the message for retry.
-    await observeRun({ notifier }, context, () =>
+    await observeRun({ notifier, history }, context, () =>
       performTransfer(
         configForRun(config, context),
         context.destinationKey,
@@ -339,9 +345,35 @@ export async function runConsumer(): Promise<void> {
   );
 }
 
+/**
+ * History retrieval entry (`npm run runner -- --history [N]`). Prints the most
+ * recent N run records (default 20) so an operator can audit backup health over
+ * time, not just the latest notification (#13, AC-02). Read-only — it never
+ * starts a transfer, so it needs only the R2 credentials.
+ */
+export async function runHistory(limit = 20): Promise<void> {
+  const config = loadConfig();
+  const r2Creds = requireR2Credentials();
+  const history = r2HistoryStore(s3HistoryTransport(makeR2Client(r2Creds)), config);
+  const records = await history.list({ limit });
+  console.log(formatHistory(records));
+}
+
+/** Parse the optional count after `--history`; falls back to 20 on absent/invalid. */
+function historyLimitArg(argv: string[]): number {
+  const i = argv.indexOf("--history");
+  const raw = i >= 0 ? argv[i + 1] : undefined;
+  const n = raw ? Number.parseInt(raw, 10) : NaN;
+  return Number.isInteger(n) && n > 0 ? n : 20;
+}
+
 // Run only when invoked directly (`npm run runner`), not when imported by tests.
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
-  const entry = process.argv.includes("--consume") ? runConsumer : main;
+  const entry = process.argv.includes("--history")
+    ? () => runHistory(historyLimitArg(process.argv))
+    : process.argv.includes("--consume")
+      ? runConsumer
+      : main;
   entry().catch((err: unknown) => {
     // Surface our own typed failures (auth, no-backups, not-found, queue,
     // transfer) as a clean, actionable message; anything else prints in full for
