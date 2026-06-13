@@ -45,12 +45,24 @@ export interface NotificationSettings {
   channel: NotificationChannel;
 }
 
+/** Missed-run / heartbeat detection settings (#14). */
+export interface MonitoringSettings {
+  /**
+   * Maximum age, in hours, of the most recent successful backup before a
+   * missed-run alert fires. Set to the schedule interval plus a grace margin
+   * (e.g. 26 for a daily backup = 24h + 2h). Defaults to 26.
+   */
+  maxAgeHours: number;
+}
+
 export interface AcfbakConfig {
   acquia: AcquiaSource;
   r2: R2Destination;
   schedule: BackupSchedule;
   /** Per-run notifications. Optional; defaults to the console channel. */
   notifications?: NotificationSettings;
+  /** Missed-run detection. Optional; defaults to a 26h max age. */
+  monitoring?: MonitoringSettings;
 }
 
 export class ConfigError extends Error {
@@ -82,6 +94,20 @@ function optionalString(
   if (value === undefined) return fallback;
   if (typeof value !== "string" || value.length === 0) {
     throw new ConfigError(`"${path}" must be a non-empty string when present`);
+  }
+  return value;
+}
+
+function optionalPositiveNumber(
+  obj: Record<string, unknown>,
+  key: string,
+  path: string,
+  fallback: number,
+): number {
+  const value = obj[key];
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new ConfigError(`"${path}" must be a positive number when present`);
   }
   return value;
 }
@@ -118,6 +144,7 @@ export function validateConfig(raw: unknown): AcfbakConfig {
       timezone: optionalString(raw.schedule, "timezone", "schedule.timezone", "UTC"),
     },
     ...validateNotifications(raw.notifications),
+    ...validateMonitoring(raw.monitoring),
   };
 }
 
@@ -138,4 +165,16 @@ function validateNotifications(raw: unknown): Pick<AcfbakConfig, "notifications"
     );
   }
   return { notifications: { channel } };
+}
+
+/**
+ * Validate the optional `monitoring` block (#14). Absent ⇒ omitted (callers
+ * default to a 26h max age). Present ⇒ `maxAgeHours` must be a positive number.
+ */
+function validateMonitoring(raw: unknown): Pick<AcfbakConfig, "monitoring"> {
+  if (raw === undefined) return {};
+  if (!isRecord(raw)) throw new ConfigError('"monitoring" must be an object when present');
+
+  const maxAgeHours = optionalPositiveNumber(raw, "maxAgeHours", "monitoring.maxAgeHours", 26);
+  return { monitoring: { maxAgeHours } };
 }

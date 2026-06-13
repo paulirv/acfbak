@@ -242,6 +242,32 @@ This is read-only (no transfer) and needs only the R2 credentials. `list` scans
 the newest month shards until it has enough records, so a long history never
 forces a full-bucket listing.
 
+### Missed-run detection
+
+A run that **never happened** erodes recovery confidence silently — there is no
+failure to notify on. The heartbeat check catches that gap
+([#14](https://github.com/paulirv/acfbak/issues/14)): it inspects the run history
+and, if no *successful* backup landed within the expected window, raises an alert
+through the **same** notification channel as a failed run.
+
+```bash
+npm run runner -- --check-heartbeat
+```
+
+Set the window in `acfbak.config.json` — the schedule interval plus a grace
+margin:
+
+```jsonc
+// acfbak.config.json — daily backup, 2h grace (defaults to 26 if omitted)
+"monitoring": { "maxAgeHours": 26 }
+```
+
+**Schedule it independently of the backup.** A dead Worker can't alert on its own
+absence, so run the check on the **runner host's cron** (separate from the Worker
+that runs the backup), at least once per backup cycle — then a miss surfaces
+before the next scheduled run. The command exits non-zero on a miss, so a cron
+mailer or uptime monitor catches it as a second, independent signal.
+
 ## Project layout
 
 ```
@@ -254,8 +280,9 @@ src/config.ts               shared config types + validator (env-agnostic)
 src/run.ts                  shared run-context + object-key convention (Worker ↔ runner)
 src/notify.ts               per-run notification events + console/webhook channels (env-agnostic)
 src/history.ts              run-history record shape + key convention + store contract (env-agnostic)
+src/monitor.ts              missed-run heartbeat check over the history (env-agnostic)
 src/worker/index.ts         orchestrator Worker (scheduled + fetch handlers, queue producer)
-src/runner/index.ts         transfer runner entry (one-shot + --consume drain + --history, observers)
+src/runner/index.ts         transfer runner entry (transfer + --consume + --history + --check-heartbeat)
 src/runner/acquia.ts        Acquia Cloud API v2 client (auth, list, select, download)
 src/runner/r2.ts            R2 S3-compatible streaming uploader (dated key, size check)
 src/runner/queue.ts         Cloudflare Queues HTTP pull/ack client + drain loop
@@ -268,10 +295,11 @@ test/unit/config.test.ts    config validator unit tests (notifications block)
 test/unit/notify.test.ts    notification channels + resolver unit tests (offline)
 test/unit/history.test.ts   run-record builders + key convention + in-memory store tests
 test/unit/history-store.test.ts  R2 history store tests (in-memory transport, offline)
+test/unit/monitor.test.ts   heartbeat check + missed-run event unit tests (offline)
 test/unit/runner.test.ts    observeRun (notify + history) + transfer-stage tests (mocked Acquia)
 test/worker/worker.test.ts  Worker integration tests (R2 binding, scheduled handoff, /trigger)
 ```
 
 ## Status
 
-The scheduled daily backup ([#1](https://github.com/paulirv/acfbak/issues/1)) is wired end to end: the Worker fires on cron, mints a run id, and hands off to the runner via a Cloudflare Queue, with a token-gated manual `/trigger` path ([#8](https://github.com/paulirv/acfbak/issues/8)). The runner consumes the queue ([#27](https://github.com/paulirv/acfbak/issues/27)), pulls the latest existing Acquia backup ([#7](https://github.com/paulirv/acfbak/issues/7)), and streams it into R2 under a dated key with size verification ([#9](https://github.com/paulirv/acfbak/issues/9)). On-demand backups ([#2](https://github.com/paulirv/acfbak/issues/2)) run through the same pipeline via the first-class `/trigger` path ([#10](https://github.com/paulirv/acfbak/issues/10)), keyed distinctly under `on-demand/` ([#11](https://github.com/paulirv/acfbak/issues/11)). Each run emits exactly one success/failure notification ([#12](https://github.com/paulirv/acfbak/issues/12)) over a configurable console/webhook channel and appends a durable run-history record in R2, retrievable via `npm run runner -- --history` ([#13](https://github.com/paulirv/acfbak/issues/13)). All component paths are unit/integration tested; a live end-to-end run awaits provisioned Acquia + Cloudflare credentials. Next: missed-run / heartbeat detection ([#14](https://github.com/paulirv/acfbak/issues/14)) closes out the observability capability ([#3](https://github.com/paulirv/acfbak/issues/3)).
+The scheduled daily backup ([#1](https://github.com/paulirv/acfbak/issues/1)) is wired end to end: the Worker fires on cron, mints a run id, and hands off to the runner via a Cloudflare Queue, with a token-gated manual `/trigger` path ([#8](https://github.com/paulirv/acfbak/issues/8)). The runner consumes the queue ([#27](https://github.com/paulirv/acfbak/issues/27)), pulls the latest existing Acquia backup ([#7](https://github.com/paulirv/acfbak/issues/7)), and streams it into R2 under a dated key with size verification ([#9](https://github.com/paulirv/acfbak/issues/9)). On-demand backups ([#2](https://github.com/paulirv/acfbak/issues/2)) run through the same pipeline via the first-class `/trigger` path ([#10](https://github.com/paulirv/acfbak/issues/10)), keyed distinctly under `on-demand/` ([#11](https://github.com/paulirv/acfbak/issues/11)). Observability ([#3](https://github.com/paulirv/acfbak/issues/3)) is complete: each run emits exactly one success/failure notification ([#12](https://github.com/paulirv/acfbak/issues/12)) over a configurable console/webhook channel, appends a durable run-history record in R2 retrievable via `npm run runner -- --history` ([#13](https://github.com/paulirv/acfbak/issues/13)), and a heartbeat check (`npm run runner -- --check-heartbeat`) alerts on a missed run through the same channel ([#14](https://github.com/paulirv/acfbak/issues/14)). All component paths are unit/integration tested; a live end-to-end run awaits provisioned Acquia + Cloudflare credentials.

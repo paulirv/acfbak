@@ -47,7 +47,11 @@ import {
   type RunRecord,
 } from "../history.ts";
 import { s3HistoryTransport, r2HistoryStore } from "./history-store.ts";
+import { checkHeartbeat, missedRunEvent, hoursLabel } from "../monitor.ts";
 import { randomUUID } from "node:crypto";
+
+/** Default max age of the newest successful backup before a missed-run alert (#14). */
+const DEFAULT_MAX_AGE_HOURS = 26;
 
 /** Load and validate acfbak.config.json from the repo root. */
 export function loadConfig(configPath?: string): AcfbakConfig {
@@ -367,13 +371,51 @@ function historyLimitArg(argv: string[]): number {
   return Number.isInteger(n) && n > 0 ? n : 20;
 }
 
+/**
+ * Heartbeat check entry (`npm run runner -- --check-heartbeat`) — the missed-run
+ * detector (#14). Reads the run history, checks whether a successful backup
+ * landed within `monitoring.maxAgeHours`, and on a miss raises an alert through
+ * the same notifier as a failed run (AC-02). Read-only (no transfer); needs only
+ * R2 credentials. Run it on the runner host's cron, independently of the
+ * backup — so a dead Worker can't suppress its own absence alert (AC: heartbeat
+ * independent of the run). Exits non-zero on a miss so a cron monitor catches it
+ * too. Detection latency is one check interval, so schedule it at least once per
+ * backup cycle to surface a miss before the next scheduled run (AC-03).
+ */
+export async function runCheckHeartbeat(): Promise<void> {
+  const config = loadConfig();
+  const r2Creds = requireR2Credentials();
+  const notifier = resolveNotifier(config);
+  const history = r2HistoryStore(s3HistoryTransport(makeR2Client(r2Creds)), config);
+
+  const maxAgeMs = (config.monitoring?.maxAgeHours ?? DEFAULT_MAX_AGE_HOURS) * 3_600_000;
+  const now = new Date();
+  const result = checkHeartbeat(await history.list({ limit: 50 }), now, maxAgeMs);
+
+  if (result.healthy) {
+    const age = result.ageMs === null ? "?" : hoursLabel(result.ageMs);
+    console.log(
+      `[acfbak runner] heartbeat OK — last success ${result.lastSuccessAt} (${age} ago, within ${hoursLabel(maxAgeMs)})`,
+    );
+    return;
+  }
+
+  await notifier.notify(missedRunEvent(result, maxAgeMs, now));
+  console.error(`[acfbak runner] heartbeat MISSED — no successful backup within ${hoursLabel(maxAgeMs)}`);
+  // Non-zero exit so an external cron/monitor also catches the miss (defence in depth).
+  process.exitCode = 1;
+}
+
 // Run only when invoked directly (`npm run runner`), not when imported by tests.
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
-  const entry = process.argv.includes("--history")
-    ? () => runHistory(historyLimitArg(process.argv))
-    : process.argv.includes("--consume")
-      ? runConsumer
-      : main;
+  const argv = process.argv;
+  const entry = argv.includes("--check-heartbeat")
+    ? runCheckHeartbeat
+    : argv.includes("--history")
+      ? () => runHistory(historyLimitArg(argv))
+      : argv.includes("--consume")
+        ? runConsumer
+        : main;
   entry().catch((err: unknown) => {
     // Surface our own typed failures (auth, no-backups, not-found, queue,
     // transfer) as a clean, actionable message; anything else prints in full for

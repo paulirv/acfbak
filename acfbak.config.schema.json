@@ -84,6 +84,19 @@
           "description": "Where terminal run signals are sent. 'console' logs to stdout/stderr; 'webhook' additionally POSTs a Slack-compatible { text } payload to NOTIFY_WEBHOOK_URL."
         }
       }
+    },
+    "monitoring": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Missed-run / heartbeat detection. Optional; defaults to a 26h max age. The check (npm run runner -- --check-heartbeat) is scheduled independently of the backup so a dead Worker can't suppress its own absence alert.",
+      "properties": {
+        "maxAgeHours": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 26,
+          "description": "Maximum age (hours) of the most recent successful backup before a missed-run alert fires. Set to the schedule interval plus a grace margin (e.g. 26 for a daily backup)."
+        }
+      }
     }
   }
 }

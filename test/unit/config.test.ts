@@ -38,3 +38,28 @@ describe("validateConfig — notifications (#12)", () => {
     expect(() => validateConfig({ ...base, notifications: "webhook" })).toThrow(ConfigError);
   });
 });
+
+describe("validateConfig — monitoring (#14)", () => {
+  it("omits monitoring when absent (callers default to 26h)", () => {
+    expect(validateConfig(base).monitoring).toBeUndefined();
+  });
+
+  it("accepts an explicit maxAgeHours", () => {
+    const config = validateConfig({ ...base, monitoring: { maxAgeHours: 49 } });
+    expect(config.monitoring).toEqual({ maxAgeHours: 49 });
+  });
+
+  it("defaults maxAgeHours to 26 when the block is present but empty", () => {
+    const config = validateConfig({ ...base, monitoring: {} });
+    expect(config.monitoring).toEqual({ maxAgeHours: 26 });
+  });
+
+  it("rejects a non-positive maxAgeHours", () => {
+    expect(() => validateConfig({ ...base, monitoring: { maxAgeHours: 0 } })).toThrow(ConfigError);
+    expect(() => validateConfig({ ...base, monitoring: { maxAgeHours: -5 } })).toThrow(ConfigError);
+  });
+
+  it("rejects a non-number maxAgeHours", () => {
+    expect(() => validateConfig({ ...base, monitoring: { maxAgeHours: "26" } })).toThrow(ConfigError);
+  });
+});
