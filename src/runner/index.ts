@@ -39,6 +39,12 @@ import {
 } from "./queue.ts";
 import { buildRunContext, type BackupRunContext } from "../run.ts";
 import { resolveNotifier, type Notifier, type TransferStage } from "../notify.ts";
+import {
+  successRecord,
+  failureRecord,
+  type HistoryStore,
+  type RunRecord,
+} from "../history.ts";
 import { randomUUID } from "node:crypto";
 
 /** Load and validate acfbak.config.json from the repo root. */
@@ -86,6 +92,23 @@ export class TransferError extends Error {
   }
 }
 
+/** What a completed transfer reports back: the stored object + its source. */
+export interface TransferResult {
+  /** R2 destination object key the dump was stored under. */
+  key: string;
+  /** Verified stored object size in bytes. */
+  size: number;
+  /** Acquia source backup id the dump came from (#13). */
+  sourceBackupId: number;
+}
+
+/** The terminal-outcome observers a run reports to (#12 notifier, #13 history). */
+export interface RunObservers {
+  notifier: Notifier;
+  /** Optional run-history store; when present, each run appends one record. */
+  history?: HistoryStore;
+}
+
 /**
  * The core transfer: pull Acquia's latest existing backup for `config`'s
  * app/env (#7) and stream it straight into R2 at `key` (#9) — discover → open
@@ -107,7 +130,7 @@ export async function performTransfer(
   acquiaCreds: AcquiaCredentials,
   transport: R2Transport,
   label: string,
-): Promise<{ key: string; size: number }> {
+): Promise<TransferResult> {
   let stage: TransferStage = "discover";
   try {
     const latest = await discoverLatestBackup(config, acquiaCreds);
@@ -137,50 +160,106 @@ export async function performTransfer(
     console.log(
       `[acfbak runner] ${label} stored r2://${config.r2.bucket}/${result.key} (${result.size} bytes)`,
     );
-    return result;
+    // Surface the Acquia source backup id alongside the upload result so the
+    // run-history record (#13) can trace the artifact back to its source.
+    return { ...result, sourceBackupId: metadata.id };
   } catch (err) {
     throw err instanceof TransferError ? err : new TransferError(stage, err);
   }
 }
 
 /**
- * Run one transfer and emit exactly one terminal notification for it (#12): a
- * success (destination key + verified size + timestamp) or, if it throws, a
- * failure (run id + failing stage + error + timestamp). The original error is
- * rethrown after the failure signal so the queue consumer still marks the
- * message for retry — the notification observes the outcome, it does not absorb
- * it. `now` is injectable for deterministic tests.
+ * Run one transfer and report its single terminal outcome to every observer:
+ * the notifier (#12) and, when present, the history store (#13). On success it
+ * emits a success notification (key + verified size + timestamp) and appends a
+ * success record (also carrying duration + source backup id); on failure it
+ * emits a failure notification (run id + failing stage + error + timestamp) and
+ * appends a failure record, then rethrows the original error so the queue
+ * consumer still marks the message for retry — observers watch the outcome, they
+ * do not absorb it.
+ *
+ * History writes are best-effort: an append failure is logged but never flips
+ * the run's real outcome (a successful backup stays successful; a failed one
+ * still rethrows). `now` is injectable for deterministic tests.
  */
-export async function runWithNotification(
-  notifier: Notifier,
+export async function observeRun(
+  observers: RunObservers,
   context: BackupRunContext,
-  perform: () => Promise<{ key: string; size: number }>,
+  perform: () => Promise<TransferResult>,
   now: () => Date = () => new Date(),
-): Promise<{ key: string; size: number }> {
+): Promise<TransferResult> {
+  const startedAt = now();
   const labelPart = context.label ? { label: context.label } : {};
   try {
     const result = await perform();
-    await notifier.notify({
+    const finishedAt = now();
+    await observers.notifier.notify({
       outcome: "success",
       runId: context.runId,
       trigger: context.trigger,
       ...labelPart,
       destinationKey: result.key,
       size: result.size,
-      timestamp: now().toISOString(),
+      timestamp: finishedAt.toISOString(),
     });
+    await appendRecord(observers.history, context.runId, () =>
+      successRecord(
+        {
+          runId: context.runId,
+          trigger: context.trigger,
+          ...labelPart,
+          destinationKey: result.key,
+          timestamp: finishedAt.toISOString(),
+          durationMs: finishedAt.getTime() - startedAt.getTime(),
+        },
+        { sizeBytes: result.size, sourceBackupId: result.sourceBackupId },
+      ),
+    );
     return result;
   } catch (err) {
-    await notifier.notify({
+    const finishedAt = now();
+    const stage = err instanceof TransferError ? err.stage : "unknown";
+    const error = err instanceof Error ? err.message : String(err);
+    await observers.notifier.notify({
       outcome: "failure",
       runId: context.runId,
       trigger: context.trigger,
       ...labelPart,
-      stage: err instanceof TransferError ? err.stage : "unknown",
-      error: err instanceof Error ? err.message : String(err),
-      timestamp: now().toISOString(),
+      stage,
+      error,
+      timestamp: finishedAt.toISOString(),
     });
+    await appendRecord(observers.history, context.runId, () =>
+      failureRecord(
+        {
+          runId: context.runId,
+          trigger: context.trigger,
+          ...labelPart,
+          destinationKey: context.destinationKey,
+          timestamp: finishedAt.toISOString(),
+          durationMs: finishedAt.getTime() - startedAt.getTime(),
+        },
+        { stage, error },
+      ),
+    );
     throw err;
+  }
+}
+
+/** Append one history record, best-effort: a store failure is logged, not thrown. */
+async function appendRecord(
+  history: HistoryStore | undefined,
+  runId: string,
+  build: () => RunRecord,
+): Promise<void> {
+  if (!history) return;
+  try {
+    await history.append(build());
+  } catch (err) {
+    console.error(
+      `[acfbak runner] run ${runId}: failed to append history record: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
 
@@ -204,9 +283,9 @@ export async function main(): Promise<void> {
   const notifier = resolveNotifier(config);
 
   // A standalone run still gets a run id + context so it emits the same terminal
-  // signal as a queue-driven one (no silent outcomes, #12).
+  // signal as a queue-driven one (no silent outcomes, #12) and records history (#13).
   const context = buildRunContext(config, new Date(), randomUUID(), "scheduled");
-  await runWithNotification(notifier, context, () =>
+  await observeRun({ notifier }, context, () =>
     performTransfer(config, context.destinationKey, acquiaCreds, transport, `run ${context.runId} (manual)`),
   );
 }
@@ -241,9 +320,9 @@ export async function runConsumer(): Promise<void> {
   const notifier = resolveNotifier(config);
 
   const summary = await drainQueueOnce(client, async (context) => {
-    // One terminal notification per message (#12); the rethrow on failure still
-    // lets drainQueueOnce mark the message for retry.
-    await runWithNotification(notifier, context, () =>
+    // One terminal signal per message to all observers (#12 notify, #13 history);
+    // the rethrow on failure still lets drainQueueOnce mark the message for retry.
+    await observeRun({ notifier }, context, () =>
       performTransfer(
         configForRun(config, context),
         context.destinationKey,

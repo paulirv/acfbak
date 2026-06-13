@@ -8,11 +8,12 @@ vi.mock("../../src/runner/acquia.ts", async (importOriginal) => {
   return { ...actual, discoverLatestBackup: discoverMock };
 });
 
-const { runWithNotification, performTransfer, TransferError } = await import("../../src/runner/index.ts");
+const { observeRun, performTransfer, TransferError } = await import("../../src/runner/index.ts");
 import type { R2Transport } from "../../src/runner/r2.ts";
 import type { Notifier, RunNotification } from "../../src/notify.ts";
 import type { AcfbakConfig } from "../../src/config.ts";
 import type { BackupRunContext } from "../../src/run.ts";
+import { inMemoryHistoryStore } from "../../src/history.ts";
 
 const config: AcfbakConfig = {
   acquia: { applicationName: "my-drupal-app", environment: "prod", database: "default" },
@@ -38,18 +39,14 @@ function recordingNotifier(): { notifier: Notifier; events: RunNotification[] } 
 }
 
 const fixedNow = () => new Date("2026-06-13T21:09:00.000Z");
+const okResult = { key: context.destinationKey, size: 4096, sourceBackupId: 77 };
 
-describe("runWithNotification — exactly one terminal signal (#12, AC-01)", () => {
+describe("observeRun — exactly one terminal signal (#12, AC-01)", () => {
   it("emits a single success event carrying key, size, and timestamp (AC-03)", async () => {
     const { notifier, events } = recordingNotifier();
-    const result = await runWithNotification(
-      notifier,
-      context,
-      async () => ({ key: context.destinationKey, size: 4096 }),
-      fixedNow,
-    );
+    const result = await observeRun({ notifier }, context, async () => okResult, fixedNow);
 
-    expect(result).toEqual({ key: context.destinationKey, size: 4096 });
+    expect(result).toEqual(okResult);
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       outcome: "success",
@@ -67,7 +64,7 @@ describe("runWithNotification — exactly one terminal signal (#12, AC-01)", () 
     const boom = new TransferError("transfer", new Error("size mismatch"));
 
     await expect(
-      runWithNotification(notifier, context, async () => {
+      observeRun({ notifier }, context, async () => {
         throw boom;
       }, fixedNow),
     ).rejects.toBe(boom);
@@ -85,7 +82,7 @@ describe("runWithNotification — exactly one terminal signal (#12, AC-01)", () 
   it("tags a non-TransferError failure as stage 'unknown'", async () => {
     const { notifier, events } = recordingNotifier();
     await expect(
-      runWithNotification(notifier, context, async () => {
+      observeRun({ notifier }, context, async () => {
         throw new Error("kaboom");
       }, fixedNow),
     ).rejects.toThrow("kaboom");
@@ -95,8 +92,69 @@ describe("runWithNotification — exactly one terminal signal (#12, AC-01)", () 
   it("omits the label for an unlabelled (scheduled) run", async () => {
     const { notifier, events } = recordingNotifier();
     const scheduled: BackupRunContext = { ...context, trigger: "scheduled", label: undefined };
-    await runWithNotification(notifier, scheduled, async () => ({ key: "k", size: 1 }), fixedNow);
+    await observeRun({ notifier }, scheduled, async () => okResult, fixedNow);
     expect(events[0]).not.toHaveProperty("label");
+  });
+});
+
+describe("observeRun — history recording (#13)", () => {
+  it("appends one success record with duration, size, and source backup id", async () => {
+    const { notifier } = recordingNotifier();
+    const history = inMemoryHistoryStore();
+    // First now() = start, second = finish → 1000ms duration.
+    let calls = 0;
+    const clock = () =>
+      new Date(calls++ === 0 ? "2026-06-13T21:09:00.000Z" : "2026-06-13T21:09:01.000Z");
+
+    await observeRun({ notifier, history }, context, async () => okResult, clock);
+
+    expect(history.records).toHaveLength(1);
+    expect(history.records[0]).toMatchObject({
+      runId: "run-1",
+      trigger: "on-demand",
+      label: "pre-deploy v2.3",
+      outcome: "success",
+      sizeBytes: 4096,
+      sourceBackupId: 77,
+      durationMs: 1000,
+      destinationKey: context.destinationKey,
+      timestamp: "2026-06-13T21:09:01.000Z",
+    });
+  });
+
+  it("appends one failure record with the failing stage", async () => {
+    const { notifier } = recordingNotifier();
+    const history = inMemoryHistoryStore();
+    await expect(
+      observeRun({ notifier, history }, context, async () => {
+        throw new TransferError("download", new Error("403"));
+      }, fixedNow),
+    ).rejects.toThrow("403");
+
+    expect(history.records).toHaveLength(1);
+    expect(history.records[0]).toMatchObject({
+      outcome: "failure",
+      stage: "download",
+      error: "403",
+      destinationKey: context.destinationKey,
+    });
+  });
+
+  it("a history append failure never flips a successful run", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { notifier } = recordingNotifier();
+    const flaky = {
+      async append() {
+        throw new Error("r2 down");
+      },
+      async list() {
+        return [];
+      },
+    };
+    const result = await observeRun({ notifier, history: flaky }, context, async () => okResult, fixedNow);
+    expect(result).toEqual(okResult); // success preserved
+    expect(err).toHaveBeenCalled(); // append failure logged
+    err.mockRestore();
   });
 });
 
@@ -161,6 +219,6 @@ describe("performTransfer — stage-tagged failures (#12, AC-02)", () => {
       openDownload: async () => ({ url: "u", contentLength: 10, body: webStreamOf(10), response: new Response() }),
     });
     const result = await performTransfer(config, "dest-key", creds, fakeTransport(10), "t");
-    expect(result).toEqual({ key: "dest-key", size: 10 });
+    expect(result).toEqual({ key: "dest-key", size: 10, sourceBackupId: 1 });
   });
 });
