@@ -40,8 +40,9 @@ Edit `acfbak.config.json` to point at your Acquia app/environment and your R2 bu
 | `CF_ACCOUNT_ID` | runner (`--consume`) | Cloudflare account ID (same account as `R2_ACCOUNT_ID`). |
 | `CF_API_TOKEN` | runner (`--consume`) | API token with **Queues** read + edit — pull/ack handoff messages. |
 | `CF_QUEUE_ID` | runner (`--consume`) | Handoff queue id (UUID) — `wrangler queues list`. |
+| `NOTIFY_WEBHOOK_URL` | runner | Webhook for per-run notifications. Only needed when `notifications.channel = "webhook"`. |
 
-The Worker writes to R2 through its **binding** (`env.BACKUPS`), so it does not need the R2 S3 keys — those are only for the runner, which writes from outside Cloudflare. The `CF_*` secrets are only needed for the queue-driven consumer (`npm run runner -- --consume`).
+The Worker writes to R2 through its **binding** (`env.BACKUPS`), so it does not need the R2 S3 keys — those are only for the runner, which writes from outside Cloudflare. The `CF_*` secrets are only needed for the queue-driven consumer (`npm run runner -- --consume`); `NOTIFY_WEBHOOK_URL` only when the webhook notification channel is selected.
 
 ### Setting secrets
 
@@ -183,6 +184,34 @@ schedule on the runner host (e.g. a cron job / CI workflow), or wrap it in a loo
 for an always-on consumer. A bare `npm run runner` instead does a single
 standalone transfer under today's dated key without touching the queue.
 
+### Per-run notifications
+
+Every backup run emits **exactly one terminal signal** — success or failure — so
+a failed backup is surfaced before the next scheduled run rather than passing
+silently ([#12](https://github.com/paulirv/acfbak/issues/12)):
+
+- **success** reports the destination key, verified artifact size, and timestamp;
+- **failure** reports the run id, the failing **stage** (`discover` → `download` →
+  `transfer`), an error summary, and timestamp.
+
+The channel is declarative — set `notifications.channel` in `acfbak.config.json`:
+
+| Channel | Behaviour | Secret |
+|---------|-----------|--------|
+| `console` (default) | Logs the signal to stdout (success) / stderr (failure). | — |
+| `webhook` | Also POSTs a Slack-compatible `{ "text": … }` payload. | `NOTIFY_WEBHOOK_URL` |
+
+```jsonc
+// acfbak.config.json
+"notifications": { "channel": "webhook" }
+```
+
+The Slack-compatible payload reaches Slack directly, or Telegram/email through a
+webhook relay. Webhook delivery is **best-effort**: a delivery error is logged
+but never flips a run's real outcome, and the console record is always written
+too. Selecting `webhook` without `NOTIFY_WEBHOOK_URL` fails loud at startup
+(before any transfer), so a misconfiguration can't cause a silent run.
+
 ## Project layout
 
 ```
@@ -192,19 +221,23 @@ wrangler.toml               Cloudflare platform manifest (cron + R2 binding + qu
 dev.json                    dev-environment manifest (dev-up / warp-drive)
 vitest.workspace.ts         vitest projects: unit (Node) + worker (Miniflare)
 src/config.ts               shared config types + validator (env-agnostic)
-src/run.ts                  shared run-context + dated object-key (Worker ↔ runner)
+src/run.ts                  shared run-context + object-key convention (Worker ↔ runner)
+src/notify.ts               per-run notification events + console/webhook channels (env-agnostic)
 src/worker/index.ts         orchestrator Worker (scheduled + fetch handlers, queue producer)
-src/runner/index.ts         transfer runner entry (one-shot + --consume queue drain)
+src/runner/index.ts         transfer runner entry (one-shot + --consume queue drain, notifications)
 src/runner/acquia.ts        Acquia Cloud API v2 client (auth, list, select, download)
 src/runner/r2.ts            R2 S3-compatible streaming uploader (dated key, size check)
 src/runner/queue.ts         Cloudflare Queues HTTP pull/ack client + drain loop
 test/unit/acquia.test.ts    Acquia client unit tests (injected fetch, offline)
-test/unit/r2.test.ts        R2 uploader unit tests (injected transport, offline)
+test/unit/r2.test.ts        R2 uploader + object-key unit tests (injected transport, offline)
 test/unit/run.test.ts       run-context + Worker enqueue-handoff unit tests
 test/unit/queue.test.ts     queue client + drain orchestration unit tests (offline)
+test/unit/config.test.ts    config validator unit tests (notifications block)
+test/unit/notify.test.ts    notification channels + resolver unit tests (offline)
+test/unit/runner.test.ts    per-run notification + transfer-stage unit tests (mocked Acquia)
 test/worker/worker.test.ts  Worker integration tests (R2 binding, scheduled handoff, /trigger)
 ```
 
 ## Status
 
-The scheduled daily backup ([#1](https://github.com/paulirv/acfbak/issues/1)) is wired end to end: the Worker fires on cron, mints a run id, and hands off to the runner via a Cloudflare Queue, with a token-gated manual `/trigger` path ([#8](https://github.com/paulirv/acfbak/issues/8)). The runner consumes the queue ([#27](https://github.com/paulirv/acfbak/issues/27)), pulls the latest existing Acquia backup ([#7](https://github.com/paulirv/acfbak/issues/7)), and streams it into R2 under a dated key with size verification ([#9](https://github.com/paulirv/acfbak/issues/9)). All component paths are unit/integration tested; a live end-to-end run awaits provisioned Acquia + Cloudflare credentials. Next: observability & alerting ([#3](https://github.com/paulirv/acfbak/issues/3)) and on-demand backups ([#2](https://github.com/paulirv/acfbak/issues/2)).
+The scheduled daily backup ([#1](https://github.com/paulirv/acfbak/issues/1)) is wired end to end: the Worker fires on cron, mints a run id, and hands off to the runner via a Cloudflare Queue, with a token-gated manual `/trigger` path ([#8](https://github.com/paulirv/acfbak/issues/8)). The runner consumes the queue ([#27](https://github.com/paulirv/acfbak/issues/27)), pulls the latest existing Acquia backup ([#7](https://github.com/paulirv/acfbak/issues/7)), and streams it into R2 under a dated key with size verification ([#9](https://github.com/paulirv/acfbak/issues/9)). On-demand backups ([#2](https://github.com/paulirv/acfbak/issues/2)) run through the same pipeline via the first-class `/trigger` path ([#10](https://github.com/paulirv/acfbak/issues/10)), keyed distinctly under `on-demand/` ([#11](https://github.com/paulirv/acfbak/issues/11)). Each run emits exactly one success/failure notification ([#12](https://github.com/paulirv/acfbak/issues/12)) over a configurable console/webhook channel. All component paths are unit/integration tested; a live end-to-end run awaits provisioned Acquia + Cloudflare credentials. Next: more observability & alerting ([#3](https://github.com/paulirv/acfbak/issues/3)) — run history ([#13](https://github.com/paulirv/acfbak/issues/13)) and missed-run detection ([#14](https://github.com/paulirv/acfbak/issues/14)).

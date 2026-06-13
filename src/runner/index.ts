@@ -37,7 +37,9 @@ import {
   drainQueueOnce,
   QueueError,
 } from "./queue.ts";
-import type { BackupRunContext } from "../run.ts";
+import { buildRunContext, type BackupRunContext } from "../run.ts";
+import { resolveNotifier, type Notifier, type TransferStage } from "../notify.ts";
+import { randomUUID } from "node:crypto";
 
 /** Load and validate acfbak.config.json from the repo root. */
 export function loadConfig(configPath?: string): AcfbakConfig {
@@ -69,6 +71,22 @@ export function requireAcquiaCredentials(
 }
 
 /**
+ * A transfer failure tagged with the pipeline stage it failed at (#12), so the
+ * per-run failure notification can name where it broke. The message is the
+ * underlying cause's message (never secret material); the original error is kept
+ * on `cause` for full debugging.
+ */
+export class TransferError extends Error {
+  constructor(
+    readonly stage: TransferStage,
+    override readonly cause: unknown,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "TransferError";
+  }
+}
+
+/**
  * The core transfer: pull Acquia's latest existing backup for `config`'s
  * app/env (#7) and stream it straight into R2 at `key` (#9) — discover → open
  * download → pipe to R2 (multipart, never fully buffered) → verify size.
@@ -79,7 +97,9 @@ export function requireAcquiaCredentials(
  * production database completes within the runner host's resources. The runner
  * is a plain host process, not subject to the Worker's CPU/time limits.
  *
- * `label` prefixes log lines (e.g. a run id) for correlation.
+ * `label` prefixes log lines (e.g. a run id) for correlation. Any failure is
+ * rethrown as a {@link TransferError} tagged with the stage that broke, so the
+ * caller's notification (#12) can report it.
  */
 export async function performTransfer(
   config: AcfbakConfig,
@@ -88,32 +108,80 @@ export async function performTransfer(
   transport: R2Transport,
   label: string,
 ): Promise<{ key: string; size: number }> {
-  const latest = await discoverLatestBackup(config, acquiaCreds);
-  const { metadata } = latest;
-  console.log(
-    `[acfbak runner] ${label} selected Acquia backup id=${metadata.id} type=${metadata.type} ` +
-      `started=${metadata.startedAt} completed=${metadata.completedAt} ` +
-      `env=${metadata.environmentUuid} db=${metadata.databaseName}`,
-  );
+  let stage: TransferStage = "discover";
+  try {
+    const latest = await discoverLatestBackup(config, acquiaCreds);
+    const { metadata } = latest;
+    console.log(
+      `[acfbak runner] ${label} selected Acquia backup id=${metadata.id} type=${metadata.type} ` +
+        `started=${metadata.startedAt} completed=${metadata.completedAt} ` +
+        `env=${metadata.environmentUuid} db=${metadata.databaseName}`,
+    );
 
-  const download = await latest.openDownload();
-  if (download.body === null) {
-    throw new Error(`${label} Acquia download returned an empty body — nothing to stream to R2.`);
+    stage = "download";
+    const download = await latest.openDownload();
+    if (download.body === null) {
+      throw new Error(`${label} Acquia download returned an empty body — nothing to stream to R2.`);
+    }
+
+    // fetch's Response.body is a web ReadableStream; Readable.fromWeb adapts it to
+    // a Node stream for the AWS SDK without buffering. (Cast bridges the ambient
+    // ReadableStream type to node:stream/web's.)
+    const body = Readable.fromWeb(download.body as unknown as NodeWebReadableStream<Uint8Array>);
+
+    stage = "transfer";
+    const result = await streamBackupToR2(
+      { bucket: config.r2.bucket, key, body, sourceContentLength: download.contentLength },
+      transport,
+    );
+    console.log(
+      `[acfbak runner] ${label} stored r2://${config.r2.bucket}/${result.key} (${result.size} bytes)`,
+    );
+    return result;
+  } catch (err) {
+    throw err instanceof TransferError ? err : new TransferError(stage, err);
   }
+}
 
-  // fetch's Response.body is a web ReadableStream; Readable.fromWeb adapts it to
-  // a Node stream for the AWS SDK without buffering. (Cast bridges the ambient
-  // ReadableStream type to node:stream/web's.)
-  const body = Readable.fromWeb(download.body as unknown as NodeWebReadableStream<Uint8Array>);
-
-  const result = await streamBackupToR2(
-    { bucket: config.r2.bucket, key, body, sourceContentLength: download.contentLength },
-    transport,
-  );
-  console.log(
-    `[acfbak runner] ${label} stored r2://${config.r2.bucket}/${result.key} (${result.size} bytes)`,
-  );
-  return result;
+/**
+ * Run one transfer and emit exactly one terminal notification for it (#12): a
+ * success (destination key + verified size + timestamp) or, if it throws, a
+ * failure (run id + failing stage + error + timestamp). The original error is
+ * rethrown after the failure signal so the queue consumer still marks the
+ * message for retry — the notification observes the outcome, it does not absorb
+ * it. `now` is injectable for deterministic tests.
+ */
+export async function runWithNotification(
+  notifier: Notifier,
+  context: BackupRunContext,
+  perform: () => Promise<{ key: string; size: number }>,
+  now: () => Date = () => new Date(),
+): Promise<{ key: string; size: number }> {
+  const labelPart = context.label ? { label: context.label } : {};
+  try {
+    const result = await perform();
+    await notifier.notify({
+      outcome: "success",
+      runId: context.runId,
+      trigger: context.trigger,
+      ...labelPart,
+      destinationKey: result.key,
+      size: result.size,
+      timestamp: now().toISOString(),
+    });
+    return result;
+  } catch (err) {
+    await notifier.notify({
+      outcome: "failure",
+      runId: context.runId,
+      trigger: context.trigger,
+      ...labelPart,
+      stage: err instanceof TransferError ? err.stage : "unknown",
+      error: err instanceof Error ? err.message : String(err),
+      timestamp: now().toISOString(),
+    });
+    throw err;
+  }
 }
 
 /**
@@ -131,9 +199,16 @@ export async function main(): Promise<void> {
   const acquiaCreds = requireAcquiaCredentials();
   const r2Creds = requireR2Credentials();
   const transport = s3Transport(makeR2Client(r2Creds));
+  // Resolve the notifier up front so a webhook misconfiguration fails before the
+  // transfer rather than leaving the run's outcome unreported.
+  const notifier = resolveNotifier(config);
 
-  const key = buildObjectKey(config, new Date(), "scheduled");
-  await performTransfer(config, key, acquiaCreds, transport, "manual");
+  // A standalone run still gets a run id + context so it emits the same terminal
+  // signal as a queue-driven one (no silent outcomes, #12).
+  const context = buildRunContext(config, new Date(), randomUUID(), "scheduled");
+  await runWithNotification(notifier, context, () =>
+    performTransfer(config, context.destinationKey, acquiaCreds, transport, `run ${context.runId} (manual)`),
+  );
 }
 
 /** Build an effective config for one run, overriding the source from its context. */
@@ -161,14 +236,21 @@ export async function runConsumer(): Promise<void> {
 
   const client = new QueuePullClient(queueCreds, fetch);
   const transport = s3Transport(makeR2Client(r2Creds));
+  // Resolve once before draining so a webhook misconfiguration fails the pass up
+  // front rather than per message.
+  const notifier = resolveNotifier(config);
 
   const summary = await drainQueueOnce(client, async (context) => {
-    await performTransfer(
-      configForRun(config, context),
-      context.destinationKey,
-      acquiaCreds,
-      transport,
-      `run ${context.runId} (${context.trigger})`,
+    // One terminal notification per message (#12); the rethrow on failure still
+    // lets drainQueueOnce mark the message for retry.
+    await runWithNotification(notifier, context, () =>
+      performTransfer(
+        configForRun(config, context),
+        context.destinationKey,
+        acquiaCreds,
+        transport,
+        `run ${context.runId} (${context.trigger})`,
+      ),
     );
   });
 
@@ -182,9 +264,12 @@ export async function runConsumer(): Promise<void> {
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   const entry = process.argv.includes("--consume") ? runConsumer : main;
   entry().catch((err: unknown) => {
-    // Surface our own typed failures (auth, no-backups, not-found, queue) as a
-    // clean, actionable message; anything else prints in full for debugging.
-    if (err instanceof AcquiaError || err instanceof QueueError) {
+    // Surface our own typed failures (auth, no-backups, not-found, queue,
+    // transfer) as a clean, actionable message; anything else prints in full for
+    // debugging. A TransferError also names the stage that broke.
+    if (err instanceof TransferError) {
+      console.error(`[acfbak runner] failed at ${err.stage}: ${err.message}`);
+    } else if (err instanceof AcquiaError || err instanceof QueueError) {
       console.error(`[acfbak runner] failed: ${err.name}: ${err.message}`);
     } else {
       console.error("[acfbak runner] failed:", err);
