@@ -55,8 +55,25 @@ export interface RunFailureEvent extends RunEventBase {
   error: string;
 }
 
-/** The single terminal signal a run emits. */
-export type RunNotification = RunSuccessEvent | RunFailureEvent;
+/**
+ * A backup that never ran (#14) — detected by an out-of-band heartbeat check,
+ * not by a run, since a dead Worker can't report its own absence. Carries no
+ * run id (there was no run); it alerts through the same channels as a failure.
+ */
+export interface MissedRunEvent {
+  outcome: "missed";
+  /** Human description of the expected window, e.g. "26h". */
+  expectedWithin: string;
+  /** ISO timestamp of the most recent successful backup, or null if none on record. */
+  lastSuccessAt: string | null;
+  /** Age of the last success in whole hours, or null if there is none on record. */
+  ageHours: number | null;
+  /** ISO-8601 timestamp the check ran. */
+  timestamp: string;
+}
+
+/** A terminal run signal (success/failure) or an out-of-band missed-run alert. */
+export type RunNotification = RunSuccessEvent | RunFailureEvent | MissedRunEvent;
 
 /** A notification sink. Implementations MUST NOT throw — a channel failure must
  * never turn a successful backup into a failure (or vice versa); they log their
@@ -67,6 +84,21 @@ export interface Notifier {
 
 /** Render a notification as a `{ subject, text }` human summary (channel-agnostic). */
 export function formatNotification(event: RunNotification): { subject: string; text: string } {
+  if (event.outcome === "missed") {
+    const last =
+      event.lastSuccessAt !== null
+        ? `last success: ${event.lastSuccessAt} (${event.ageHours}h ago)`
+        : `last success: none on record`;
+    return {
+      subject: `acfbak backup MISSED — none in ${event.expectedWithin}`,
+      text:
+        `⚠️ acfbak backup MISSED\n` +
+        `no successful backup within ${event.expectedWithin}\n` +
+        `${last}\n` +
+        `checked at: ${event.timestamp}`,
+    };
+  }
+
   const origin = event.label ? `${event.trigger} "${event.label}"` : event.trigger;
   if (event.outcome === "success") {
     return {
@@ -121,6 +153,8 @@ export function webhookNotifier(url: string, fetchImpl: FetchLike): Notifier {
   return {
     async notify(event) {
       const { text } = formatNotification(event);
+      // A missed-run alert has no run id — label it generically for the log line.
+      const ref = event.outcome === "missed" ? "heartbeat" : `run ${event.runId}`;
       try {
         const res = await fetchImpl(url, {
           method: "POST",
@@ -128,13 +162,11 @@ export function webhookNotifier(url: string, fetchImpl: FetchLike): Notifier {
           body: JSON.stringify({ text }),
         });
         if (!res.ok) {
-          console.error(
-            `[acfbak notify] webhook delivery failed (HTTP ${res.status}) for run ${event.runId}`,
-          );
+          console.error(`[acfbak notify] webhook delivery failed (HTTP ${res.status}) for ${ref}`);
         }
       } catch (err) {
         console.error(
-          `[acfbak notify] webhook delivery error for run ${event.runId}: ` +
+          `[acfbak notify] webhook delivery error for ${ref}: ` +
             `${err instanceof Error ? err.message : String(err)}`,
         );
       }

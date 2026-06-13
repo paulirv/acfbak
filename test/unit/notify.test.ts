@@ -58,6 +58,31 @@ describe("formatNotification (#12)", () => {
   it("surfaces an on-demand label in the origin", () => {
     expect(formatNotification(failure).text).toContain('on-demand "pre-deploy v2.3"');
   });
+
+  it("renders a missed-run alert with the window and last success (#14)", () => {
+    const { subject, text } = formatNotification({
+      outcome: "missed",
+      expectedWithin: "26h",
+      lastSuccessAt: "2026-06-11T03:00:00.000Z",
+      ageHours: 48,
+      timestamp: "2026-06-13T12:00:00.000Z",
+    });
+    expect(subject).toContain("MISSED");
+    expect(text).toContain("within 26h");
+    expect(text).toContain("2026-06-11T03:00:00.000Z");
+    expect(text).toContain("48h ago");
+  });
+
+  it("renders a missed-run alert when there is no success on record (#14)", () => {
+    const { text } = formatNotification({
+      outcome: "missed",
+      expectedWithin: "26h",
+      lastSuccessAt: null,
+      ageHours: null,
+      timestamp: "2026-06-13T12:00:00.000Z",
+    });
+    expect(text).toContain("none on record");
+  });
 });
 
 describe("consoleNotifier (#12)", () => {
