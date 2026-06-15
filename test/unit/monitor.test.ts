@@ -25,34 +25,43 @@ describe("checkHeartbeat (#14, AC-01)", () => {
     const records = [success("r1", new Date(now.getTime() - 3 * 3_600_000).toISOString())];
     const result = checkHeartbeat(records, now, maxAgeMs);
     expect(result.healthy).toBe(true);
-    expect(result.lastSuccessAt).toBe(records[0]!.timestamp);
+    expect(result.lastSuccess?.at).toBe(records[0]!.timestamp);
   });
 
   it("is unhealthy when the most recent success is older than the window", () => {
     const records = [success("r1", new Date(now.getTime() - 2 * DAY).toISOString())];
     const result = checkHeartbeat(records, now, maxAgeMs);
     expect(result.healthy).toBe(false);
-    expect(result.ageMs).toBe(2 * DAY);
+    expect(result.lastSuccess?.ageMs).toBe(2 * DAY);
   });
 
   it("is unhealthy when there is no success on record at all", () => {
     const result = checkHeartbeat([], now, maxAgeMs);
-    expect(result).toEqual({ healthy: false, lastSuccessAt: null, ageMs: null });
+    expect(result).toEqual({ healthy: false, lastSuccess: null });
   });
 
   it("ignores failed runs — a failure is not a successful backup", () => {
     const records = [failure("r1", new Date(now.getTime() - 1 * 3_600_000).toISOString())];
     const result = checkHeartbeat(records, now, maxAgeMs);
     expect(result.healthy).toBe(false);
-    expect(result.lastSuccessAt).toBeNull();
+    expect(result.lastSuccess).toBeNull();
   });
 
   it("selects the most recent success regardless of input order", () => {
     const old = success("old", new Date(now.getTime() - 5 * DAY).toISOString());
     const fresh = success("fresh", new Date(now.getTime() - 2 * 3_600_000).toISOString());
     const result = checkHeartbeat([fresh, old], now, maxAgeMs);
-    expect(result.lastSuccessAt).toBe(fresh.timestamp);
+    expect(result.lastSuccess?.at).toBe(fresh.timestamp);
     expect(result.healthy).toBe(true);
+  });
+
+  it("orders successes chronologically, not lexically, across timezone offsets", () => {
+    // 10:00Z written with a +02:00 offset (12:00+02:00) is LATER than 11:00Z,
+    // but sorts earlier as a string. Chronological selection must pick 12:00+02:00.
+    const utcEarlier = success("utc", "2026-06-13T11:00:00.000Z"); // 11:00Z
+    const offsetLater = success("off", "2026-06-13T14:00:00.000+02:00"); // 12:00Z
+    const result = checkHeartbeat([utcEarlier, offsetLater], now, maxAgeMs);
+    expect(result.lastSuccess?.at).toBe(offsetLater.timestamp);
   });
 });
 
@@ -67,7 +76,7 @@ describe("missedRunEvent (#14, AC-02)", () => {
     expect(event).toEqual({
       outcome: "missed",
       expectedWithin: "26h",
-      lastSuccessAt: result.lastSuccessAt,
+      lastSuccessAt: result.lastSuccess?.at ?? null,
       ageHours: 48,
       timestamp: now.toISOString(),
     });

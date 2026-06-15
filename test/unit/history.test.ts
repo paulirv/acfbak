@@ -87,6 +87,21 @@ describe("inMemoryHistoryStore (#13, AC-02)", () => {
     }
     expect(await store.list()).toHaveLength(20);
   });
+
+  it("latestSuccess finds the newest success even under newer failures (#14)", async () => {
+    const store = inMemoryHistoryStore();
+    await store.append(successRecord({ ...base, runId: "ok" }, { sizeBytes: 1, sourceBackupId: 1 }));
+    for (let i = 0; i < 30; i++) {
+      await store.append(failureRecord({ ...base, runId: `fail-${i}` }, { stage: "transfer", error: "x" }));
+    }
+    expect((await store.latestSuccess())?.runId).toBe("ok");
+  });
+
+  it("latestSuccess returns null when no success is on record", async () => {
+    const store = inMemoryHistoryStore();
+    await store.append(failureRecord({ ...base, runId: "f" }, { stage: "discover", error: "x" }));
+    expect(await store.latestSuccess()).toBeNull();
+  });
 });
 
 describe("formatHistory (#13, AC-02)", () => {

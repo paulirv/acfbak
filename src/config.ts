@@ -45,6 +45,14 @@ export interface NotificationSettings {
   channel: NotificationChannel;
 }
 
+/**
+ * Default max age (hours) of the newest successful backup before a missed-run
+ * alert fires (#14). The single code-level source of this default — the config
+ * validator and every consumer read it from here. (The JSON schema mirrors it as
+ * its declarative `default`.)
+ */
+export const DEFAULT_MAX_AGE_HOURS = 26;
+
 /** Missed-run / heartbeat detection settings (#14). */
 export interface MonitoringSettings {
   /**
@@ -175,6 +183,11 @@ function validateMonitoring(raw: unknown): Pick<AcfbakConfig, "monitoring"> {
   if (raw === undefined) return {};
   if (!isRecord(raw)) throw new ConfigError('"monitoring" must be an object when present');
 
-  const maxAgeHours = optionalPositiveNumber(raw, "maxAgeHours", "monitoring.maxAgeHours", 26);
+  const maxAgeHours = optionalPositiveNumber(
+    raw,
+    "maxAgeHours",
+    "monitoring.maxAgeHours",
+    DEFAULT_MAX_AGE_HOURS,
+  );
   return { monitoring: { maxAgeHours } };
 }

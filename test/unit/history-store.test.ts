@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { r2HistoryStore, type HistoryTransport } from "../../src/runner/history-store.ts";
-import { successRecord } from "../../src/history.ts";
+import { successRecord, failureRecord } from "../../src/history.ts";
 import type { AcfbakConfig } from "../../src/config.ts";
 
 const config: AcfbakConfig = {
@@ -36,6 +36,19 @@ function recordAt(runId: string, timestamp: string) {
       durationMs: 1000,
     },
     { sizeBytes: 100, sourceBackupId: 1 },
+  );
+}
+
+function failureAt(runId: string, timestamp: string) {
+  return failureRecord(
+    {
+      runId,
+      trigger: "scheduled",
+      destinationKey: `acquia/prod/${timestamp.slice(0, 10)}/db.sql.gz`,
+      timestamp,
+      durationMs: 1000,
+    },
+    { stage: "transfer", error: "boom" },
   );
 }
 
@@ -78,5 +91,32 @@ describe("r2HistoryStore.list (#13, AC-02)", () => {
   it("returns an empty list when there is no history", async () => {
     const store = r2HistoryStore(fakeTransport(), config, fixedNow);
     expect(await store.list()).toEqual([]);
+  });
+});
+
+describe("r2HistoryStore.latestSuccess (#14)", () => {
+  it("finds the newest success even when many newer failures follow it", async () => {
+    const transport = fakeTransport();
+    const store = r2HistoryStore(transport, config, fixedNow);
+    await store.append(recordAt("ok", "2026-06-12T03:00:00.000Z"));
+    for (let i = 0; i < 60; i++) {
+      await store.append(failureAt(`fail-${i}`, `2026-06-13T05:00:00.${String(i).padStart(3, "0")}Z`));
+    }
+    expect((await store.latestSuccess())?.runId).toBe("ok");
+  });
+
+  it("scans back across month shards to find an older success", async () => {
+    const transport = fakeTransport();
+    const store = r2HistoryStore(transport, config, fixedNow);
+    await store.append(recordAt("may-ok", "2026-05-30T03:00:00.000Z"));
+    await store.append(failureAt("jun-fail", "2026-06-10T03:00:00.000Z"));
+    expect((await store.latestSuccess())?.runId).toBe("may-ok");
+  });
+
+  it("returns null when no success is on record", async () => {
+    const transport = fakeTransport();
+    const store = r2HistoryStore(transport, config, fixedNow);
+    await store.append(failureAt("f", "2026-06-12T03:00:00.000Z"));
+    expect(await store.latestSuccess()).toBeNull();
   });
 });

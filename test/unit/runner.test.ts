@@ -150,6 +150,9 @@ describe("observeRun — history recording (#13)", () => {
       async list() {
         return [];
       },
+      async latestSuccess() {
+        return null;
+      },
     };
     const result = await observeRun({ notifier, history: flaky }, context, async () => okResult, fixedNow);
     expect(result).toEqual(okResult); // success preserved

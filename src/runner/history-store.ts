@@ -120,6 +120,23 @@ export function r2HistoryStore(
         .filter((body): body is string => body !== null)
         .map((body) => JSON.parse(body) as RunRecord);
     },
+    async latestSuccess() {
+      const prefix = historyPrefix(config);
+      // Scan shards newest-first and, within each, keys newest-first (keys are
+      // timestamp-prefixed). Fetch one at a time and stop at the first success,
+      // so a flood of newer failures can never hide it (the count-bounded `list`
+      // would) and the common case (newest run succeeded) costs a single get.
+      for (const shard of recentMonthShards(now(), MAX_MONTHS_LOOKBACK)) {
+        const keys = (await transport.listKeys(bucket, `${prefix}${shard}/`)).sort().reverse();
+        for (const key of keys) {
+          const body = await transport.get(bucket, key);
+          if (!body) continue;
+          const record = JSON.parse(body) as RunRecord;
+          if (record.outcome === "success") return record;
+        }
+      }
+      return null;
+    },
   };
 }
 

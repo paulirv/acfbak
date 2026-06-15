@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { Readable } from "node:stream";
 import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
-import { validateConfig, type AcfbakConfig } from "../config.ts";
+import { validateConfig, DEFAULT_MAX_AGE_HOURS, type AcfbakConfig } from "../config.ts";
 import { discoverLatestBackup, AcquiaError, type AcquiaCredentials } from "./acquia.ts";
 import {
   requireR2Credentials,
@@ -38,7 +38,7 @@ import {
   QueueError,
 } from "./queue.ts";
 import { buildRunContext, type BackupRunContext } from "../run.ts";
-import { resolveNotifier, type Notifier, type TransferStage } from "../notify.ts";
+import { resolveNotifier, consoleNotifier, type Notifier, type TransferStage } from "../notify.ts";
 import {
   successRecord,
   failureRecord,
@@ -49,9 +49,6 @@ import {
 import { s3HistoryTransport, r2HistoryStore } from "./history-store.ts";
 import { checkHeartbeat, missedRunEvent, hoursLabel } from "../monitor.ts";
 import { randomUUID } from "node:crypto";
-
-/** Default max age of the newest successful backup before a missed-run alert (#14). */
-const DEFAULT_MAX_AGE_HOURS = 26;
 
 /** Load and validate acfbak.config.json from the repo root. */
 export function loadConfig(configPath?: string): AcfbakConfig {
@@ -375,8 +372,11 @@ function historyLimitArg(argv: string[]): number {
  * Heartbeat check entry (`npm run runner -- --check-heartbeat`) — the missed-run
  * detector (#14). Reads the run history, checks whether a successful backup
  * landed within `monitoring.maxAgeHours`, and on a miss raises an alert through
- * the same notifier as a failed run (AC-02). Read-only (no transfer); needs only
- * R2 credentials. Run it on the runner host's cron, independently of the
+ * the same notifier as a failed run (AC-02). Read-only (no transfer); the only
+ * required credentials are R2 — the alert channel is best-effort, so if it is
+ * unconfigured on this host (e.g. a webhook URL absent on the separate
+ * heartbeat host) the check still runs and falls back to console plus the
+ * non-zero exit. Run it on the runner host's cron, independently of the
  * backup — so a dead Worker can't suppress its own absence alert (AC: heartbeat
  * independent of the run). Exits non-zero on a miss so a cron monitor catches it
  * too. Detection latency is one check interval, so schedule it at least once per
@@ -385,17 +385,33 @@ function historyLimitArg(argv: string[]): number {
 export async function runCheckHeartbeat(): Promise<void> {
   const config = loadConfig();
   const r2Creds = requireR2Credentials();
-  const notifier = resolveNotifier(config);
+  // The alert channel is best-effort here: a notifier-config problem (e.g. no
+  // webhook URL on this separate heartbeat host) must never stop the check from
+  // surfacing a miss. Fall back to console — the non-zero exit is the
+  // independent signal a cron monitor relies on regardless.
+  let notifier: Notifier;
+  try {
+    notifier = resolveNotifier(config);
+  } catch (err) {
+    console.error(
+      `[acfbak runner] alert channel unavailable, using console only: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+    notifier = consoleNotifier();
+  }
   const history = r2HistoryStore(s3HistoryTransport(makeR2Client(r2Creds)), config);
 
   const maxAgeMs = (config.monitoring?.maxAgeHours ?? DEFAULT_MAX_AGE_HOURS) * 3_600_000;
   const now = new Date();
-  const result = checkHeartbeat(await history.list({ limit: 50 }), now, maxAgeMs);
+  // latestSuccess (not list) so a burst of newer failures can't hide an
+  // in-window success and fire a false miss.
+  const latest = await history.latestSuccess();
+  const result = checkHeartbeat(latest ? [latest] : [], now, maxAgeMs);
 
   if (result.healthy) {
-    const age = result.ageMs === null ? "?" : hoursLabel(result.ageMs);
     console.log(
-      `[acfbak runner] heartbeat OK — last success ${result.lastSuccessAt} (${age} ago, within ${hoursLabel(maxAgeMs)})`,
+      `[acfbak runner] heartbeat OK — last success ${result.lastSuccess.at} ` +
+        `(${hoursLabel(result.lastSuccess.ageMs)} ago, within ${hoursLabel(maxAgeMs)})`,
     );
     return;
   }

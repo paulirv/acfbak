@@ -114,6 +114,15 @@ export interface HistoryStore {
   append(record: RunRecord): Promise<void>;
   /** Return recent records, most-recent first, capped at `limit` (default 20). */
   list(opts?: { limit?: number }): Promise<RunRecord[]>;
+  /**
+   * The most recent **successful** run on record, or null if none. Distinct from
+   * `list` because the heartbeat check (#14) must find the newest success even
+   * when many newer failures exist — a count-bounded `list` would let a burst of
+   * failures push the last success out of view and fire a false missed-run
+   * alert. Scans newest-first and stops at the first success, so it is also
+   * cheaper than fetching a fixed window when the newest run already succeeded.
+   */
+  latestSuccess(): Promise<RunRecord | null>;
 }
 
 /**
@@ -130,6 +139,12 @@ export function inMemoryHistoryStore(): HistoryStore & { records: RunRecord[] } 
     async list(opts) {
       const limit = opts?.limit ?? 20;
       return records.slice(-limit).reverse();
+    },
+    async latestSuccess() {
+      for (let i = records.length - 1; i >= 0; i--) {
+        if (records[i]!.outcome === "success") return records[i]!;
+      }
+      return null;
     },
   };
 }
