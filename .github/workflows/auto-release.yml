@@ -1,0 +1,125 @@
+name: Auto Release
+
+# Automated semantic versioning, provisioned by BoB (`cdprov refresh` with a
+# `versioning` block in the project manifest — see #276 / capability #275).
+# On a push to the main branch (or a manual dispatch), commit-and-tag-version
+# bumps the version from Conventional Commit messages, regenerates CHANGELOG.md,
+# tags the release, and a GitHub Release is published from the new section.
+#
+# main and 22 are substituted by provision_versioning
+# from the manifest's versioning block. Per-project-type push path filters are
+# layered on by the orchestrator (#277); by default any push to the main branch
+# is eligible to cut a release.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'package.json'
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        default: 'auto'
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+
+# RUNNER (#1782). The runner is resolved from the repo variable CI_RUNNER_LABEL,
+# exactly as ci.yml does (#1694): unset is the empty string, so unset *is* the
+# hosted default. On a repo whose hosted Actions minutes are exhausted or
+# billing-blocked, a hardcoded `ubuntu-latest` job fails in ~3 seconds with no
+# steps and no runner — which is how releases silently stopped being cut while
+# CI (already on the variable) stayed green.
+#
+# Nothing here is hosted-only: Node comes from actions/setup-node (no system
+# Node required), and git + gh are the only other binaries, both present on a
+# BoB fleet runner. See runbooks/self-hosted-runner.md.
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ${{ vars.CI_RUNNER_LABEL || 'ubuntu-latest' }}
+    # Skip release commits to avoid an infinite loop; always run a manual dispatch.
+    if: github.event_name == 'workflow_dispatch' || !startsWith(github.event.head_commit.message, 'chore(release)')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create release (bump + changelog + tag)
+        run: |
+          BUMP_TYPE="${{ github.event.inputs.version_bump }}"
+          if [[ "$BUMP_TYPE" == "auto" || -z "$BUMP_TYPE" ]]; then
+            echo "Automatic version bump from conventional commits"
+            npm run release
+          else
+            echo "Manual version bump: $BUMP_TYPE"
+            npm run release -- --release-as "$BUMP_TYPE"
+          fi
+
+      - name: Read new version
+        id: version
+        run: echo "version=v$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Push release commit and tag (atomic, bounded retry)
+        run: |
+          # Atomic: a rejected branch push also rejects the tag, so a commit
+          # landing mid-job can never strand an orphaned tag that wedges every
+          # future release on a tag collision (#1501). Bounded retry: rebase
+          # the release commit onto whatever landed, re-tag, re-push — the
+          # release still lands despite the race instead of merely failing.
+          TAG="v$(node -p "require('./package.json').version")"
+          for attempt in 1 2 3; do
+            if git push --atomic --follow-tags origin main; then
+              exit 0
+            fi
+            echo "push rejected (attempt $attempt/3) — rebasing onto latest main"
+            git fetch origin main
+            if ! git rebase "origin/main"; then
+              git rebase --abort
+              echo "rebase conflict — failing cleanly; atomic push stranded nothing, the next push retriggers a release" >&2
+              exit 1
+            fi
+            git tag -f "$TAG"
+          done
+          echo "push failed after 3 attempts — nothing stranded (atomic), the next push retriggers a release" >&2
+          exit 1
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.version }}"
+          VERSION="${TAG#v}"
+          NOTES=$(awk -v ver="$VERSION" '
+            index($0, "## [" ver "]") == 1 || index($0, "## " ver) == 1 { flag=1; next }
+            /^## / { if (flag) exit }
+            flag { print }
+          ' CHANGELOG.md)
+          if [ -n "$NOTES" ]; then
+            gh release create "$TAG" --title "$TAG" --notes "$NOTES" --verify-tag
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag
+          fi
+          echo "Published release $TAG"

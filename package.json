@@ -5,6 +5,7 @@
   "description": "Acquia Cloud → Cloudflare R2 backup: a Worker orchestrates the schedule, a runner transfers the dump.",
   "type": "module",
   "scripts": {
+    "release": "commit-and-tag-version",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "test": "vitest run --passWithNoTests",
@@ -13,6 +14,7 @@
     "runner": "node --experimental-strip-types src/runner/index.ts"
   },
   "devDependencies": {
+    "commit-and-tag-version": "^12.6.0",
     "@cloudflare/vitest-pool-workers": "^0.5.40",
     "@cloudflare/workers-types": "^4.20250109.0",
     "@types/node": "^22.10.5",

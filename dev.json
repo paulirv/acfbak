@@ -3,12 +3,20 @@
   "_comment": "acfbak has no database — only a Cloudflare Worker (wrangler dev, with a local R2). No migrations, seed, or auth steps.",
   "server": {
     "command": "npm run dev",
-    "port": 8787,
+    "port": 6170,
     "health": "/health",
     "restart": "on-failure",
     "env": {}
   },
   "access": {
-    "localhost": "http://localhost:8787"
+    "localhost": "http://localhost:6170"
+  },
+  "_bob_ports": {
+    "_comment": "generated from the operator's ports.json — do not edit (regenerate via bob init)",
+    "base": 6170,
+    "vite": 6170,
+    "wrangler": 6171,
+    "dashboard": 6172,
+    "docs": 6173
   }
 }

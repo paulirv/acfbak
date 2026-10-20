@@ -1,0 +1,16 @@
+{
+  "header": "# Changelog\n\nAll notable changes to this project are documented here. This file is maintained automatically by [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) from Conventional Commit messages.\n",
+  "releaseCommitMessageFormat": "chore(release): {{currentTag}} [skip ci]",
+  "types": [
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Bug Fixes" },
+    { "type": "perf", "section": "Performance" },
+    { "type": "refactor", "section": "Refactoring" },
+    { "type": "docs", "section": "Documentation" },
+    { "type": "test", "section": "Tests" },
+    { "type": "build", "section": "Build System" },
+    { "type": "ci", "section": "Continuous Integration" },
+    { "type": "chore", "hidden": true },
+    { "type": "style", "hidden": true }
+  ]
+}

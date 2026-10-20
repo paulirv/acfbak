@@ -43,3 +43,8 @@ enabled = true
 
 # NOTE: No secrets here. Acquia credentials are set via `wrangler secret put`
 # (see README). Never commit credentials to this file.
+
+# >>> bob:ports — generated from the operator's ports.json; do not edit (regenerate via bob init) >>>
+# base=6170 vite=6170 wrangler=6171 dashboard=6172 docs=6173
+# wire wrangler dev to 6171 via `wrangler dev --port 6171` or [dev] port
+# <<< bob:ports <<<
